@@ -1,15 +1,50 @@
-[data]
-dir = "data/cpret/P2Dup"
+[storage]
+db_path = "data/app.sqlite3"
+upload_dir = "data/uploads"
+index_cache_dir = "data/index_cache"
+legacy_data_dir = "data/cpret/P2Dup"
+
+[admin]
+session_hours = 8
+password_hash_env = "YUANTIJI_ADMIN_PASSWORD_HASH"
+signing_secret_env = "YUANTIJI_ADMIN_SIGNING_SECRET"
+
+[limits]
+upload_max_bytes = 104857600
+jsonl_max_line_bytes = 1048576
+field_max_text_chars = 200000
+
+[jobs]
+poll_seconds = 2
+rewrite_max_attempts = 3
+embedding_max_attempts = 3
+embedding_batch_size = 16
 
 [api]
 request_timeout = 240
 
-[retrieval]
+[search]
+top_per_doc_view = 50
 top_retrieval = 200
 top_display = 20
-default_alpha = 0.50
-default_beta = 0.75
+rerank_top_k = 50
+alpha = 0.50
+beta = 0.75
 default_rerank = true
+rerank_range_floor = 0.1
+embedding_range_floor = 0.05
+
+[index_cache]
+keep_retired = 3
+load_mode = "mmap"
+activation_drain_timeout_seconds = 30
+
+[audit]
+retention_days = 90
+
+[audit.pricing.deepseek.deepseek-v4-flash]
+input_price_per_1m_tokens_microusd = 100000
+output_price_per_1m_tokens_microusd = 300000
 
 [models.rewrite]
 model = "deepseek-v4-flash"
@@ -17,7 +52,7 @@ url = "https://api.deepseek.com/chat/completions"
 api_key_env = "DEEPSEEK_API_KEY"
 
 [models.embedding]
-model = "qwen/qwen3-embedding-8b"
+model = "Qwen/Qwen3-Embedding-8B"
 url = "https://openrouter.ai/api/v1/embeddings"
 api_key_env = "OPENROUTER_API_KEY"
 
@@ -25,4 +60,3 @@ api_key_env = "OPENROUTER_API_KEY"
 model = "Qwen/Qwen3-Reranker-8B"
 url = "https://api.deepinfra.com/v1/inference/{model}"
 api_key_env = "DEEPINFRA_API_KEY"
-

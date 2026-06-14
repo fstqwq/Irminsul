@@ -2,6 +2,8 @@ fastapi
 uvicorn
 numpy
 requests
+pydantic
+python-multipart
+itsdangerous
 pytest
 httpx
-

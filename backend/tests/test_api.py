@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 
 from fastapi.testclient import TestClient
 
-from backend.main import create_app
-from backend.models import Candidate
+import app as app_module
+from app import create_app
+from search import Candidate
 
 
 def test_health_and_config() -> None:
@@ -17,12 +17,13 @@ def test_health_and_config() -> None:
 
     assert health.status_code == 200
     assert health.json()["ok"] is True
+    assert health.json()["problem_count"] > 0
     assert config.status_code == 200
     assert config.json()["top_display"] == 20
 
 
 def test_search_stream_with_mocks(monkeypatch) -> None:
-    import backend.service as service
+    import search as search_module
 
     class FakeIndex:
         def embed_query_vector(self, *args, **kwargs) -> list[float]:
@@ -49,14 +50,14 @@ def test_search_stream_with_mocks(monkeypatch) -> None:
         return FakeIndex()
 
     def fake_rewrite(*args, **kwargs):
-        from backend.models import RewriteResult
+        from search import RewriteResult
 
         return RewriteResult("rewritten statement", "rewritten abstract", "raw")
 
     app = create_app()
     app.dependency_overrides = {}
-    monkeypatch.setattr("backend.main.index", fake_index)
-    monkeypatch.setattr(service, "rewrite_query", fake_rewrite)
+    monkeypatch.setattr(app_module, "legacy_index", fake_index)
+    monkeypatch.setattr(search_module, "rewrite_query", fake_rewrite)
     client = TestClient(app)
 
     response = client.post(
@@ -69,4 +70,3 @@ def test_search_stream_with_mocks(monkeypatch) -> None:
     assert [event["type"] for event in events][-2:] == ["candidates", "done"]
     assert any(event["type"] == "rewrite" for event in events)
     assert events[-2]["candidates"][0]["title"] == "Sample"
-

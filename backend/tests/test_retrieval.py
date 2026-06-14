@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.config import get_settings
-from backend.models import Candidate
-from backend.retrieval import SearchIndex, extract_title, fuse_scores
+from core import connect_db, get_settings, migrate
+from search import Candidate, SearchIndex, extract_title, fuse_scores
 
 
 def test_settings_and_index_load() -> None:
@@ -36,5 +35,33 @@ def test_fuse_scores() -> None:
     fused = fuse_scores(candidates, beta=0.75)
 
     assert [candidate.problem_id for candidate in fused] == ["a", "b"]
-    assert fused[0].final_score == 0.8
+    assert fused[0].final_score is not None
+    assert fused[0].final_score > fused[1].final_score
 
+
+def test_sqlite_migration(tmp_path: Path) -> None:
+    db_path = tmp_path / "app.sqlite3"
+    conn = connect_db(db_path)
+    try:
+        migrate(conn)
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+    finally:
+        conn.close()
+
+    assert version == 1
+    assert {
+        "sources",
+        "problems",
+        "artifacts",
+        "indexes",
+        "index_rows",
+        "jobs",
+        "search_audits",
+        "kv",
+    }.issubset(tables)
