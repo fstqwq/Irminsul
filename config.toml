@@ -1,0 +1,28 @@
+[data]
+dir = "data/cpret/P2Dup"
+
+[api]
+request_timeout = 240
+
+[retrieval]
+top_retrieval = 200
+top_display = 20
+default_alpha = 0.50
+default_beta = 0.75
+default_rerank = true
+
+[models.rewrite]
+model = "deepseek-v4-flash"
+url = "https://api.deepseek.com/chat/completions"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models.embedding]
+model = "qwen/qwen3-embedding-8b"
+url = "https://openrouter.ai/api/v1/embeddings"
+api_key_env = "OPENROUTER_API_KEY"
+
+[models.rerank]
+model = "Qwen/Qwen3-Reranker-8B"
+url = "https://api.deepinfra.com/v1/inference/{model}"
+api_key_env = "DEEPINFRA_API_KEY"
+

@@ -1,0 +1,2 @@
+"""FastAPI retrieval service package."""
+
