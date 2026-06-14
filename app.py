@@ -21,12 +21,13 @@ from core import SRC_DIR, Settings, db_connection, ensure_database, get_settings
 from pipeline import (
     batch_update_problems,
     confirm_import_job,
+    create_cleanup_job,
     create_build_index_job,
     create_import_dry_run,
-    execute_build_index_job,
     get_index,
     get_job,
     index_cache_path,
+    JobWorker,
     list_jobs,
     list_import_jobs,
     list_indexes,
@@ -34,6 +35,7 @@ from pipeline import (
     list_sources,
     patch_problem,
     patch_source,
+    recover_startup,
     retry_job,
 )
 from search import (
@@ -294,8 +296,14 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         current_settings = settings()
         ensure_database(current_settings)
+        recover_startup(current_settings)
         _load_active_index(current_settings, index_state())
-        yield
+        worker = JobWorker(current_settings)
+        worker.start()
+        try:
+            yield
+        finally:
+            worker.stop()
 
     app = FastAPI(title="Yuantiji", version="0.2.0", lifespan=lifespan)
     app.add_middleware(
@@ -521,8 +529,15 @@ def create_app() -> FastAPI:
     def index_build(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
         try:
-            job = create_build_index_job(settings())
-            return _decode_job(execute_build_index_job(job["key"], settings()))
+            return _decode_job(create_build_index_job(settings()))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/admin/api/jobs/cleanup")
+    def cleanup_job(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+        del session
+        try:
+            return _decode_job(create_cleanup_job(settings()))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

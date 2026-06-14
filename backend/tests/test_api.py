@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +12,18 @@ import app as app_module
 from app import create_app
 from core import db_connection, ensure_database, get_settings, hash_password, text_key, utc_now
 from search import IndexState, RewriteResult
+
+
+def wait_for_job(client: TestClient, key: str, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(f"/admin/api/jobs/{key}")
+        assert response.status_code == 200
+        job = response.json()
+        if job["status"] in {"succeeded", "blocked", "failed"}:
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"job did not finish: {key}")
 
 
 def test_health_and_config() -> None:
@@ -133,7 +146,11 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         db_path=tmp_path / "app.sqlite3",
         upload_dir=tmp_path / "uploads",
     )
-    test_settings = replace(base_settings, storage=storage)
+    test_settings = replace(
+        base_settings,
+        storage=storage,
+        jobs=replace(base_settings.jobs, poll_seconds=0),
+    )
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
     monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
     monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
@@ -169,7 +186,7 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
             headers={"X-CSRF-Token": csrf},
         )
         assert confirm.status_code == 200
-        job = confirm.json()
+        job = wait_for_job(client, payload["job_key"])
         assert job["status"] == "succeeded"
         assert job["result"]["new"] == 1
 
@@ -235,7 +252,11 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
         upload_dir=tmp_path / "uploads",
         index_cache_dir=tmp_path / "index_cache",
     )
-    test_settings = replace(base_settings, storage=storage)
+    test_settings = replace(
+        base_settings,
+        storage=storage,
+        jobs=replace(base_settings.jobs, poll_seconds=0),
+    )
     ensure_database(test_settings)
     state = IndexState()
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
@@ -298,7 +319,9 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
 
         build = client.post("/admin/api/index/build", headers={"X-CSRF-Token": csrf})
         assert build.status_code == 200
-        index_key = build.json()["result"]["index_key"]
+        build_job = wait_for_job(client, build.json()["key"])
+        assert build_job["status"] == "succeeded"
+        index_key = build_job["result"]["index_key"]
 
         activate = client.post(
             f"/admin/api/index/{index_key}/activate",

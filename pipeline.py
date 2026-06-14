@@ -5,6 +5,7 @@ import hashlib
 import uuid
 import shutil
 import gc
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -30,6 +31,67 @@ from search import REWRITE_PROMPT, VIEWS, RewriteResult, embed_texts, normalize_
 
 
 ImportMode = Literal["upsert", "insert_only", "sync_source"]
+
+
+class JobWorker:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="yuantiji-job-worker", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            processed = run_next_job(self.settings)
+            if not processed:
+                self._stop.wait(max(0.05, float(self.settings.jobs.poll_seconds)))
+
+
+def recover_startup(settings: Settings) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'", (utc_now(),))
+            conn.execute(
+                "UPDATE artifacts SET status = 'pending', updated_at = ? WHERE status = 'running'",
+                (utc_now(),),
+            )
+    building_dir = settings.storage.index_cache_dir / ".building"
+    if building_dir.exists():
+        shutil.rmtree(building_dir)
+
+
+def run_next_job(settings: Settings) -> bool:
+    with db_connection(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE status = 'queued'
+            ORDER BY created_at
+            LIMIT 1
+            """
+        ).fetchone()
+    if row is None:
+        return False
+
+    job = row_to_dict(row)
+    try:
+        if job["type"] == "import":
+            execute_import_job(job["key"], settings)
+        elif job["type"] == "build_index":
+            execute_build_index_job(job["key"], settings)
+        elif job["type"] == "cleanup":
+            execute_cleanup_job(job["key"], settings)
+        else:
+            _mark_job_failed(settings, job["key"], f"unsupported job type: {job['type']}")
+    except Exception as exc:
+        _mark_job_failed(settings, job["key"], str(exc))
+    return True
 
 
 @dataclass(frozen=True)
@@ -289,7 +351,10 @@ def confirm_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                 (now, job_key),
             )
 
-    return execute_import_job(job_key, settings)
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("import job not found after confirm")
+    return job
 
 
 def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
@@ -1267,11 +1332,77 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
                 """,
                 (utc_now(), job_key),
             )
-    if job["type"] == "build_index":
-        return execute_build_index_job(job_key, settings)
-    if job["type"] == "import":
-        return execute_import_job(job_key, settings)
     return get_job(settings, job_key) or job
+
+
+def create_cleanup_job(settings: Settings) -> dict[str, Any]:
+    job_key = "j:" + uuid.uuid4().hex
+    now = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                VALUES (?, 'cleanup', 'queued', ?, ?, ?, ?)
+                """,
+                (job_key, json_dumps({}), json_dumps({"phase": "queued"}), now, now),
+            )
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("cleanup job was not created")
+    return job
+
+
+def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
+    cutoff = utc_now()
+    removed_audits = 0
+    with db_connection(settings) as conn:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE key = ? AND type = 'cleanup'",
+            (job_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("cleanup job not found")
+        if row["status"] != "queued":
+            raise ValueError("cleanup job is not queued")
+        with conn:
+            conn.execute(
+                "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ?",
+                (json_dumps({"phase": "audits"}), utc_now(), job_key),
+            )
+            cursor = conn.execute(
+                """
+                DELETE FROM search_audits
+                WHERE started_at < datetime('now', ?)
+                """,
+                (f"-{settings.audit.retention_days} days",),
+            )
+            removed_audits = cursor.rowcount
+
+    building_dir = settings.storage.index_cache_dir / ".building"
+    if building_dir.exists():
+        shutil.rmtree(building_dir)
+
+    return _finish_job(
+        settings,
+        job_key,
+        "succeeded",
+        {"removed_audits": removed_audits, "cutoff": cutoff},
+        None,
+    )
+
+
+def _mark_job_failed(settings: Settings, job_key: str, error: str) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE key = ? AND status IN ('queued', 'running')
+                """,
+                (error[:4000], utc_now(), job_key),
+            )
 
 
 def _update_job_progress(settings: Settings, job_key: str, progress: dict[str, Any]) -> None:
