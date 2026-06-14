@@ -3,17 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from core import connect_db, get_settings, migrate
-from search import Candidate, SearchIndex, extract_title, fuse_scores
+from search import Candidate, VIEWS, extract_title, fuse_scores
 
 
-def test_settings_and_index_load() -> None:
+def test_settings_load() -> None:
     settings = get_settings()
-    index = SearchIndex(settings.data_dir)
 
-    assert Path(settings.data_dir).exists()
-    assert index.corpus_count > 0
-    assert index.embedding_shape[0] > 0
-    assert index.embedding_shape[1] == 4096
+    assert settings.storage.db_path.name == "app.sqlite3"
+    assert settings.search.top_per_doc_view == 50
+    assert VIEWS == ("clean", "statement", "abstract", "abstract_zh")
 
 
 def test_title_fallbacks() -> None:

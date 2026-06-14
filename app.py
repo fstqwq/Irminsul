@@ -17,7 +17,16 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 from pydantic import BaseModel, Field
 
-from core import SRC_DIR, Settings, db_connection, ensure_database, get_settings, utc_now, verify_password
+from core import (
+    SRC_DIR,
+    Settings,
+    db_connection,
+    ensure_database,
+    get_settings,
+    row_to_dict,
+    utc_now,
+    verify_password,
+)
 from pipeline import (
     batch_update_problems,
     confirm_import_job,
@@ -42,7 +51,6 @@ from pipeline import (
 )
 from search import (
     IndexState,
-    SearchIndex,
     get_search_audit,
     list_search_audits,
     load_index_cache,
@@ -83,11 +91,6 @@ class SourcePatch(BaseModel):
 @lru_cache(maxsize=1)
 def settings() -> Settings:
     return get_settings()
-
-
-@lru_cache(maxsize=1)
-def legacy_index() -> SearchIndex:
-    return SearchIndex(settings().data_dir)
 
 
 @lru_cache(maxsize=1)
@@ -321,16 +324,15 @@ def create_app() -> FastAPI:
         current_settings = settings()
         state = index_state()
         active_index = state.current
-        current_index = None if active_index else legacy_index()
         return {
             "ok": True,
             "loaded_index_key": active_index.key if active_index else None,
-            "problem_count": active_index.problem_count if active_index else current_index.corpus_count,
-            "embedding_shape": active_index.embedding_shape if active_index else current_index.embedding_shape,
+            "problem_count": active_index.problem_count if active_index else 0,
+            "embedding_shape": active_index.embedding_shape if active_index else None,
             "views": list(active_index.texts.keys()) if active_index else ["statement", "abstract"],
             "switching": state.switching,
             "data_dir": str(current_settings.data_dir),
-            "corpus_count": active_index.problem_count if active_index else current_index.corpus_count,
+            "corpus_count": active_index.problem_count if active_index else 0,
         }
 
     @app.get("/api/config")
@@ -390,13 +392,32 @@ def create_app() -> FastAPI:
     @app.get("/admin/api/dashboard")
     def dashboard(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
-        current_index = legacy_index()
+        current_settings = settings()
+        with db_connection(current_settings) as conn:
+            problem_count = conn.execute(
+                "SELECT count(*) FROM problems WHERE deleted = 0"
+            ).fetchone()[0]
+            source_count = conn.execute("SELECT count(*) FROM sources").fetchone()[0]
+            active = conn.execute(
+                "SELECT value FROM kv WHERE key = 'active_index_key'"
+            ).fetchone()
+            current_job = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('queued', 'running')
+                ORDER BY created_at
+                LIMIT 1
+                """
+            ).fetchone()
+            today_searches = conn.execute(
+                "SELECT count(*) FROM search_audits WHERE started_at >= date('now')"
+            ).fetchone()[0]
         return {
-            "problem_count": current_index.corpus_count,
-            "source_count": 0,
-            "active_index_key": None,
-            "current_job": None,
-            "today_searches": 0,
+            "problem_count": problem_count,
+            "source_count": source_count,
+            "active_index_key": active["value"] if active else None,
+            "current_job": _decode_job(row_to_dict(current_job)) if current_job else None,
+            "today_searches": today_searches,
         }
 
     @app.get("/admin/api/problems")

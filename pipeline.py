@@ -7,6 +7,7 @@ import shutil
 import gc
 import threading
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1444,6 +1445,115 @@ def create_cleanup_job(settings: Settings) -> dict[str, Any]:
     return job
 
 
+def _ensure_inside(root: Path, target: Path) -> Path:
+    root_path = root.resolve()
+    target_path = target.resolve()
+    if target_path == root_path or root_path not in target_path.parents:
+        raise ValueError(f"refusing to delete outside configured directory: {target}")
+    return target_path
+
+
+def _remove_file_inside(root: Path, target: Path) -> int:
+    _ensure_inside(root, target)
+    if target.is_file():
+        target.unlink()
+        return 1
+    return 0
+
+
+def _remove_dir_inside(root: Path, target: Path) -> int:
+    _ensure_inside(root, target)
+    if target.is_dir():
+        shutil.rmtree(target)
+        return 1
+    return 0
+
+
+def _active_import_uploads(settings: Settings) -> set[Path]:
+    upload_root = settings.storage.upload_dir
+    protected: set[Path] = set()
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT payload
+            FROM jobs
+            WHERE type = 'import' AND status IN ('draft', 'queued', 'running')
+            """
+        ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+            path = Path(str(payload.get("path", "")))
+            protected.add(_ensure_inside(upload_root, path))
+        except Exception:
+            continue
+    return protected
+
+
+def _cleanup_expired_uploads(settings: Settings) -> int:
+    upload_root = settings.storage.upload_dir
+    if not upload_root.exists():
+        return 0
+    protected = _active_import_uploads(settings)
+    cutoff = datetime.now(UTC) - timedelta(days=settings.audit.retention_days)
+    removed = 0
+    for path in upload_root.iterdir():
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in protected:
+            continue
+        modified_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+        if modified_at < cutoff:
+            removed += _remove_file_inside(upload_root, path)
+    return removed
+
+
+def _kept_index_cache_names(settings: Settings) -> set[str]:
+    keep_keys: set[str] = set()
+    with db_connection(settings) as conn:
+        active = conn.execute(
+            "SELECT value FROM kv WHERE key = 'active_index_key'"
+        ).fetchone()
+        if active is not None:
+            keep_keys.add(str(active["value"]))
+        keep_keys.update(
+            str(row["key"])
+            for row in conn.execute(
+                "SELECT key FROM indexes WHERE status = 'active'"
+            ).fetchall()
+        )
+        if settings.index_cache.keep_retired > 0:
+            keep_keys.update(
+                str(row["key"])
+                for row in conn.execute(
+                    """
+                    SELECT key
+                    FROM indexes
+                    WHERE status IN ('built', 'retired')
+                    ORDER BY COALESCE(activated_at, created_at) DESC
+                    LIMIT ?
+                    """,
+                    (settings.index_cache.keep_retired,),
+                ).fetchall()
+            )
+    return {_safe_path_key(key) for key in keep_keys}
+
+
+def _cleanup_old_index_caches(settings: Settings) -> int:
+    cache_root = settings.storage.index_cache_dir
+    if not cache_root.exists():
+        return 0
+    keep_names = _kept_index_cache_names(settings)
+    removed = 0
+    for path in cache_root.iterdir():
+        if path.name == ".building" or not path.is_dir():
+            continue
+        if path.name not in keep_names:
+            removed += _remove_dir_inside(cache_root, path)
+    return removed
+
+
 def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
     cutoff = utc_now()
     removed_audits = 0
@@ -1470,15 +1580,25 @@ def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
             )
             removed_audits = cursor.rowcount
 
+    _update_job_progress(settings, job_key, {"phase": "uploads"})
+    removed_uploads = _cleanup_expired_uploads(settings)
+
+    _update_job_progress(settings, job_key, {"phase": "cache"})
     building_dir = settings.storage.index_cache_dir / ".building"
-    if building_dir.exists():
-        shutil.rmtree(building_dir)
+    removed_building_dirs = _remove_dir_inside(settings.storage.index_cache_dir, building_dir)
+    removed_index_caches = _cleanup_old_index_caches(settings)
 
     return _finish_job(
         settings,
         job_key,
         "succeeded",
-        {"removed_audits": removed_audits, "cutoff": cutoff},
+        {
+            "removed_audits": removed_audits,
+            "removed_uploads": removed_uploads,
+            "removed_building_dirs": removed_building_dirs,
+            "removed_index_caches": removed_index_caches,
+            "cutoff": cutoff,
+        },
         None,
     )
 

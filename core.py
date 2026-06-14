@@ -90,6 +90,7 @@ class IndexCacheConfig:
 @dataclass(frozen=True)
 class AuditConfig:
     retention_days: int
+    pricing: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -223,7 +224,14 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
                 index_cache.get("activation_drain_timeout_seconds", 30)
             ),
         ),
-        audit=AuditConfig(retention_days=int(audit.get("retention_days", 90))),
+        audit=AuditConfig(
+            retention_days=int(audit.get("retention_days", 90)),
+            pricing=(
+                dict(audit.get("pricing", {}))
+                if isinstance(audit.get("pricing", {}), dict)
+                else {}
+            ),
+        ),
         request_timeout=int(raw.get("api", {}).get("request_timeout", 240)),
         rewrite_model=_model_config("rewrite", models.get("rewrite", {})),
         embedding_model=_model_config("embedding", models.get("embedding", {})),

@@ -5,7 +5,6 @@ import re
 import threading
 import time
 import uuid
-from collections import defaultdict
 from collections.abc import Iterator, Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -16,7 +15,7 @@ from typing import Any
 import numpy as np
 import requests
 
-from core import ModelConfig, SearchConfig, Settings, db_connection, json_dumps, row_to_dict, utc_now
+from core import ModelConfig, Settings, db_connection, json_dumps, row_to_dict, utc_now
 
 
 VIEWS = ("clean", "statement", "abstract", "abstract_zh")
@@ -64,6 +63,24 @@ class LoadedIndex:
             return None
         first = next(iter(self.matrices.values()))
         return tuple(first.shape)  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class RewriteCallResult:
+    rewrite: RewriteResult
+    usage: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EmbeddingCallResult:
+    vectors: np.ndarray
+    usage: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RerankCallResult:
+    scores: list[float]
+    usage: dict[str, Any]
 
 
 class IndexState:
@@ -275,7 +292,21 @@ def parse_rewrite_output(text: str) -> RewriteResult:
     )
 
 
-def rewrite_query(model_config: ModelConfig, text: str, timeout: int = 240) -> RewriteResult:
+def _public_usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if isinstance(item, (str, int, float, bool)) or item is None
+    }
+
+
+def rewrite_query_with_usage(
+    model_config: ModelConfig,
+    text: str,
+    timeout: int = 240,
+) -> RewriteCallResult:
     if not model_config.api_key:
         raise ValueError(f"{model_config.api_key_env} is not configured")
     response = requests.post(
@@ -299,14 +330,22 @@ def rewrite_query(model_config: ModelConfig, text: str, timeout: int = 240) -> R
     response.raise_for_status()
     payload = response.json()
     raw = payload["choices"][0]["message"]["content"]
-    return parse_rewrite_output(raw)
+    return RewriteCallResult(parse_rewrite_output(raw), _public_usage(payload.get("usage")))
 
 
-def embed_texts(model_config: ModelConfig, texts: list[str], timeout: int = 240) -> np.ndarray:
+def rewrite_query(model_config: ModelConfig, text: str, timeout: int = 240) -> RewriteResult:
+    return rewrite_query_with_usage(model_config, text, timeout).rewrite
+
+
+def embed_texts_with_usage(
+    model_config: ModelConfig,
+    texts: list[str],
+    timeout: int = 240,
+) -> EmbeddingCallResult:
     if not model_config.api_key:
         raise ValueError(f"{model_config.api_key_env} is not configured")
     if not texts:
-        return np.empty((0, 0), dtype=np.float32)
+        return EmbeddingCallResult(np.empty((0, 0), dtype=np.float32), {"input_count": 0})
 
     response = requests.post(
         model_config.resolved_url,
@@ -325,19 +364,25 @@ def embed_texts(model_config: ModelConfig, texts: list[str], timeout: int = 240)
     payload: dict[str, Any] = response.json()
     data = sorted(payload["data"], key=lambda item: item["index"])
     vectors = np.array([item["embedding"] for item in data], dtype=np.float32)
-    return normalize_matrix(vectors)
+    usage = _public_usage(payload.get("usage"))
+    usage.setdefault("input_count", len(texts))
+    return EmbeddingCallResult(normalize_matrix(vectors), usage)
 
 
-def rerank_documents(
+def embed_texts(model_config: ModelConfig, texts: list[str], timeout: int = 240) -> np.ndarray:
+    return embed_texts_with_usage(model_config, texts, timeout).vectors
+
+
+def rerank_documents_with_usage(
     model_config: ModelConfig,
     query: str,
     documents: list[str],
     timeout: int = 240,
-) -> list[float]:
+) -> RerankCallResult:
     if not model_config.api_key:
         raise ValueError(f"{model_config.api_key_env} is not configured")
     if not documents:
-        return []
+        return RerankCallResult([], {"pair_count": 0})
 
     response = requests.post(
         model_config.resolved_url,
@@ -353,159 +398,18 @@ def rerank_documents(
     scores = payload.get("scores")
     if not isinstance(scores, list) or len(scores) != len(documents):
         raise ValueError(f"Unexpected reranker response: {payload}")
-    return [float(score) for score in scores]
+    usage = _public_usage(payload.get("usage"))
+    usage.setdefault("pair_count", len(documents))
+    return RerankCallResult([float(score) for score in scores], usage)
 
 
-class SearchIndex:
-    def __init__(self, data_dir: Path):
-        self.data_dir = data_dir
-        self.corpus_by_id = {row["id"]: row for row in read_jsonl_list(data_dir / "corpus.jsonl")}
-        self.rewritten_by_id = {
-            row["id"]: row for row in read_jsonl_list(data_dir / "rewritten_corpus.jsonl")
-        }
-        self.documents = read_jsonl_list(data_dir / "documents.jsonl")
-        self.embeddings = np.load(data_dir / "embeddings.npy")
-        self._validate()
-        self._fused_cache: dict[float, tuple[list[str], np.ndarray]] = {}
-
-    def _validate(self) -> None:
-        if len(self.documents) != self.embeddings.shape[0]:
-            raise ValueError(
-                "documents/embeddings row count mismatch: "
-                f"{len(self.documents)} != {self.embeddings.shape[0]}"
-            )
-        for index, document in enumerate(self.documents):
-            if document.get("row") != index:
-                raise ValueError(f"documents row mismatch at index {index}")
-
-    @property
-    def corpus_count(self) -> int:
-        return len(self.rewritten_by_id)
-
-    @property
-    def embedding_shape(self) -> tuple[int, ...]:
-        return tuple(self.embeddings.shape)
-
-    def title_for_id(self, problem_id: str) -> str:
-        rewritten = self.rewritten_by_id.get(problem_id)
-        original = self.corpus_by_id.get(problem_id)
-        title = extract_title(rewritten, "")
-        if title:
-            return title
-        return extract_title(original, problem_id)
-
-    def fused_corpus(self, alpha: float) -> tuple[list[str], np.ndarray]:
-        cache_key = round(float(alpha), 4)
-        cached = self._fused_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        rows_by_id: dict[str, dict[str, int]] = defaultdict(dict)
-        for document in self.documents:
-            rows_by_id[document["id"]][document["kind"]] = int(document["row"])
-
-        ids: list[str] = []
-        vectors: list[np.ndarray] = []
-        for problem_id, rows_by_kind in rows_by_id.items():
-            if "statement" not in rows_by_kind or "abstract" not in rows_by_kind:
-                continue
-            vector = (
-                cache_key * self.embeddings[rows_by_kind["statement"]]
-                + (1.0 - cache_key) * self.embeddings[rows_by_kind["abstract"]]
-            )
-            ids.append(problem_id)
-            vectors.append(vector)
-
-        matrix = normalize_matrix(np.array(vectors, dtype=np.float32))
-        self._fused_cache[cache_key] = (ids, matrix)
-        return ids, matrix
-
-    def embed_query_vector(
-        self,
-        embedding_model: ModelConfig,
-        statement: str,
-        abstract: str | None,
-        alpha: float,
-        timeout: int,
-        timings: dict[str, float] | None = None,
-    ) -> np.ndarray:
-        start = perf_counter()
-        if abstract is None:
-            query_embeddings = embed_texts(embedding_model, [statement], timeout=timeout)
-            query_vector = query_embeddings[0]
-            input_count = 1
-        else:
-            query_embeddings = embed_texts(embedding_model, [statement, abstract], timeout=timeout)
-            query_vector = normalize_matrix(
-                np.array(
-                    [alpha * query_embeddings[0] + (1.0 - alpha) * query_embeddings[1]],
-                    dtype=np.float32,
-                )
-            )[0]
-            input_count = 2
-        if timings is not None:
-            timings["query_embedding"] = perf_counter() - start
-            timings["query_embedding_inputs"] = float(input_count)
-        return query_vector
-
-    def search_with_vector(
-        self,
-        query_vector: np.ndarray,
-        alpha: float,
-        top_k: int,
-        timings: dict[str, float] | None = None,
-    ) -> list[Candidate]:
-        start = perf_counter()
-        corpus_ids, corpus_matrix = self.fused_corpus(alpha)
-        if timings is not None:
-            timings["load_fused_corpus"] = perf_counter() - start
-
-        start = perf_counter()
-        scores = corpus_matrix @ query_vector
-        ranked_indices = top_indices(scores, min(top_k, len(corpus_ids)))
-        if timings is not None:
-            timings["local_search"] = perf_counter() - start
-
-        start = perf_counter()
-        candidates: list[Candidate] = []
-        for index in ranked_indices:
-            problem_id = corpus_ids[int(index)]
-            rewritten = self.rewritten_by_id[problem_id]
-            original = self.corpus_by_id.get(problem_id, {})
-            summaries = rewritten["summaries"]
-            candidates.append(
-                Candidate(
-                    problem_id=problem_id,
-                    title=self.title_for_id(problem_id),
-                    url=rewritten.get("url") or original.get("url", ""),
-                    original_text=original.get("text", ""),
-                    statement=summaries.get("statement", ""),
-                    abstract=summaries.get("abstract", ""),
-                    embedding_score=float(scores[int(index)]),
-                )
-            )
-        if timings is not None:
-            timings["candidate_build"] = perf_counter() - start
-        return candidates
-
-    def rerank(
-        self,
-        rerank_model: ModelConfig,
-        query_statement: str,
-        candidates: list[Candidate],
-        timeout: int,
-    ) -> list[Candidate]:
-        scores = rerank_documents(
-            rerank_model,
-            query_statement,
-            [f"{candidate.original_text}\n\n{candidate.statement}" for candidate in candidates],
-            timeout=timeout,
-        )
-        reranked = [
-            replace(candidate, rerank_score=score)
-            for candidate, score in zip(candidates, scores, strict=True)
-        ]
-        return sorted(reranked, key=lambda candidate: candidate.rerank_score or 0.0, reverse=True)
+def rerank_documents(
+    model_config: ModelConfig,
+    query: str,
+    documents: list[str],
+    timeout: int = 240,
+) -> list[float]:
+    return rerank_documents_with_usage(model_config, query, documents, timeout).scores
 
 
 def fuse_scores(
@@ -564,6 +468,92 @@ def query_views_from_rewrite(rewrite: RewriteResult) -> dict[str, str]:
     }
 
 
+def _numeric(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _model_pricing(
+    settings: Settings,
+    model_config: ModelConfig,
+) -> tuple[str | None, dict[str, Any]]:
+    pricing = settings.audit.pricing
+    for provider, provider_models in pricing.items():
+        if not isinstance(provider_models, dict):
+            continue
+        model_pricing = provider_models.get(model_config.model)
+        if isinstance(model_pricing, dict):
+            return str(provider), dict(model_pricing)
+    return None, {}
+
+
+def _estimate_cost_microusd(usage: dict[str, Any], pricing: dict[str, Any]) -> int:
+    if not pricing:
+        return 0
+    input_tokens = _numeric(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+    output_tokens = _numeric(
+        usage.get("completion_tokens", usage.get("output_tokens", 0))
+    )
+    if input_tokens == 0 and output_tokens == 0:
+        input_tokens = _numeric(usage.get("total_tokens", 0))
+
+    pair_count = _numeric(usage.get("pair_count", 0))
+    cost = 0.0
+    cost += (
+        input_tokens
+        * _numeric(pricing.get("input_price_per_1m_tokens_microusd"))
+        / 1_000_000
+    )
+    cost += (
+        output_tokens
+        * _numeric(pricing.get("output_price_per_1m_tokens_microusd"))
+        / 1_000_000
+    )
+    cost += pair_count * _numeric(pricing.get("price_per_1k_pairs_microusd")) / 1_000
+    cost += (
+        pair_count
+        * _numeric(pricing.get("price_per_1m_pairs_microusd"))
+        / 1_000_000
+    )
+    cost += pair_count * _numeric(pricing.get("price_per_pair_microusd"))
+    return int(round(cost))
+
+
+def _api_call_entry(
+    stage: str,
+    model_config: ModelConfig,
+    usage: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    provider, pricing = _model_pricing(settings, model_config)
+    cost_microusd = _estimate_cost_microusd(usage, pricing)
+    return {
+        "stage": stage,
+        "provider": provider,
+        "model": model_config.model,
+        "usage": usage,
+        "pricing": pricing,
+        "cost": {"microusd": cost_microusd},
+    }
+
+
+def _total_cost(api_calls: list[dict[str, Any]]) -> dict[str, int]:
+    total = 0
+    for call in api_calls:
+        cost = call.get("cost")
+        if isinstance(cost, dict):
+            total += int(_numeric(cost.get("microusd", 0)))
+    return {"microusd": total}
+
+
 def retrieve_loaded_index(
     loaded_index: LoadedIndex,
     query_vectors: np.ndarray,
@@ -613,6 +603,7 @@ def search_events_loaded(
     search_config = settings.search
     request_id = uuid.uuid4().hex
     started_at = utc_now()
+    api_calls: list[dict[str, Any]] = []
 
     try:
         edited_statement = (request.edited_statement or "").strip()
@@ -638,10 +629,19 @@ def search_events_loaded(
         elif request.use_rewrite:
             yield _stage("rewrite", "active")
             start = perf_counter()
-            rewrite = rewrite_query(
+            rewrite_call = rewrite_query_with_usage(
                 settings.rewrite_model,
                 request.query_text,
                 timeout=settings.request_timeout,
+            )
+            rewrite = rewrite_call.rewrite
+            api_calls.append(
+                _api_call_entry(
+                    "rewrite",
+                    settings.rewrite_model,
+                    rewrite_call.usage,
+                    settings,
+                )
             )
             elapsed = perf_counter() - start
             timings["rewrite"] = elapsed
@@ -673,12 +673,22 @@ def search_events_loaded(
 
         yield _stage("embed", "active", detail="4 input")
         embed_start = perf_counter()
-        query_vectors = embed_texts(
+        embedding_call = embed_texts_with_usage(
             settings.embedding_model,
             [views[view] for view in VIEWS],
             timeout=settings.request_timeout,
         )
-        query_vectors = normalize_matrix(np.asarray(query_vectors, dtype=np.float32))
+        query_vectors = normalize_matrix(
+            np.asarray(embedding_call.vectors, dtype=np.float32)
+        )
+        api_calls.append(
+            _api_call_entry(
+                "embedding",
+                settings.embedding_model,
+                embedding_call.usage,
+                settings,
+            )
+        )
         embed_elapsed = perf_counter() - embed_start
         timings["embed"] = embed_elapsed
         yield _stage("embed", "done", elapsed=embed_elapsed, detail="4 input")
@@ -703,7 +713,7 @@ def search_events_loaded(
             rerank_candidates = candidates[: search_config.rerank_top_k]
             yield _stage("rerank", "active", detail=f"{len(rerank_candidates)} candidates")
             rerank_start = perf_counter()
-            scores = rerank_documents(
+            rerank_call = rerank_documents_with_usage(
                 settings.rerank_model,
                 views["abstract_zh"],
                 [
@@ -711,6 +721,15 @@ def search_events_loaded(
                     for candidate in rerank_candidates
                 ],
                 timeout=settings.request_timeout,
+            )
+            scores = rerank_call.scores
+            api_calls.append(
+                _api_call_entry(
+                    "rerank",
+                    settings.rerank_model,
+                    rerank_call.usage,
+                    settings,
+                )
             )
             reranked = {
                 candidate.problem_id: replace(candidate, rerank_score=score)
@@ -740,9 +759,9 @@ def search_events_loaded(
             user_agent=user_agent,
             query=request.query_text,
             timings=timings,
-            api_calls=[],
+            api_calls=api_calls,
             result=result_summary,
-            cost={"microusd": 0},
+            cost=_total_cost(api_calls),
             error=None,
         )
         yield ndjson_event(
@@ -761,9 +780,9 @@ def search_events_loaded(
             user_agent=user_agent,
             query=getattr(request, "query_text", ""),
             timings=timings,
-            api_calls=[],
+            api_calls=api_calls,
             result={"candidates": []},
-            cost={"microusd": 0},
+            cost=_total_cost(api_calls),
             error=str(exc),
         )
         yield ndjson_event("error", message=str(exc))
@@ -860,121 +879,3 @@ def _stage(name: str, state: str, elapsed: float | None = None, detail: str = ""
     if detail:
         payload["detail"] = detail
     return ndjson_event("stage", **payload)
-
-
-def search_events(request: Any, settings: Settings, index: SearchIndex) -> Iterator[str]:
-    timings: dict[str, float | str] = {}
-    search_config: SearchConfig = settings.search
-
-    try:
-        edited_statement = (request.edited_statement or "").strip()
-        edited_abstract = (request.edited_abstract or "").strip()
-        use_edited_rewrite = bool(edited_statement)
-
-        if use_edited_rewrite:
-            statement = edited_statement
-            abstract = edited_abstract or None
-            timings["rewrite"] = "edited"
-            yield _stage("rewrite", "done", detail="edited")
-            yield ndjson_event(
-                "rewrite",
-                statement=statement,
-                abstract=abstract or "",
-                raw="",
-                edited=True,
-            )
-        elif request.use_rewrite:
-            yield _stage("rewrite", "active")
-            start = perf_counter()
-            rewrite = rewrite_query(
-                settings.rewrite_model,
-                request.query_text,
-                timeout=settings.request_timeout,
-            )
-            elapsed = perf_counter() - start
-            timings["rewrite"] = elapsed
-            statement = rewrite.statement
-            abstract = rewrite.abstract
-            yield _stage("rewrite", "done", elapsed=elapsed)
-            yield ndjson_event(
-                "rewrite",
-                statement=rewrite.statement,
-                abstract=rewrite.abstract,
-                raw=rewrite.raw,
-                edited=False,
-            )
-        else:
-            statement = request.query_text.strip()
-            abstract = None
-            timings["rewrite"] = "off"
-            yield _stage("rewrite", "skip", detail="off")
-
-        if not statement:
-            raise ValueError("query text is empty")
-
-        query_timings: dict[str, float] = {}
-        input_count = 1 if abstract is None else 2
-        yield _stage("embed", "active", detail=f"{input_count} input")
-        embed_start = perf_counter()
-        query_vector = index.embed_query_vector(
-            settings.embedding_model,
-            statement,
-            abstract,
-            alpha=request.alpha,
-            timeout=settings.request_timeout,
-            timings=query_timings,
-        )
-        embed_elapsed = perf_counter() - embed_start
-        timings["embed"] = embed_elapsed
-        yield _stage("embed", "done", elapsed=embed_elapsed, detail=f"{input_count} input")
-
-        yield _stage("search", "active", detail=f"top{search_config.top_retrieval}")
-        search_start = perf_counter()
-        candidates = index.search_with_vector(
-            query_vector,
-            alpha=request.alpha,
-            top_k=search_config.top_retrieval,
-            timings=query_timings,
-        )
-        search_elapsed = perf_counter() - search_start
-        timings["search"] = search_elapsed
-        yield _stage(
-            "search",
-            "done",
-            elapsed=search_elapsed,
-            detail=f"{len(candidates)} candidates",
-        )
-
-        if request.use_rerank:
-            rerank_candidates = candidates[: search_config.rerank_top_k]
-            yield _stage("rerank", "active", detail=f"{len(rerank_candidates)} candidates")
-            rerank_start = perf_counter()
-            reranked = index.rerank(
-                settings.rerank_model,
-                abstract or statement,
-                rerank_candidates,
-                timeout=settings.request_timeout,
-            )
-            rerank_by_id = {candidate.problem_id: candidate for candidate in reranked}
-            candidates = [rerank_by_id.get(candidate.problem_id, candidate) for candidate in candidates]
-            rerank_elapsed = perf_counter() - rerank_start
-            timings["rerank"] = rerank_elapsed
-            yield _stage("rerank", "done", elapsed=rerank_elapsed)
-        else:
-            timings["rerank"] = "off"
-            yield _stage("rerank", "skip", detail="off")
-
-        fused = fuse_scores(
-            candidates,
-            request.beta,
-            search_config.rerank_range_floor,
-            search_config.embedding_range_floor,
-        )
-        yield ndjson_event(
-            "candidates",
-            candidates=[asdict(candidate) for candidate in fused],
-            timings=timings,
-        )
-        yield ndjson_event("done")
-    except Exception as exc:
-        yield ndjson_event("error", message=str(exc))

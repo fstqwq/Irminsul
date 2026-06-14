@@ -34,7 +34,7 @@ def test_health_and_config() -> None:
 
     assert health.status_code == 200
     assert health.json()["ok"] is True
-    assert health.json()["problem_count"] > 0
+    assert health.json()["problem_count"] >= 0
     assert config.status_code == 200
     assert config.json()["top_display"] == 20
 
@@ -76,28 +76,34 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
     def fake_rewrite(*args, **kwargs):
         from search import RewriteResult
 
-        return RewriteResult(
-            statement="rewritten statement",
-            abstract="rewritten abstract",
-            abstract_zh="rewritten abstract zh",
-            clean="rewritten clean",
-            raw="raw",
+        return search_module.RewriteCallResult(
+            RewriteResult(
+                statement="rewritten statement",
+                abstract="rewritten abstract",
+                abstract_zh="rewritten abstract zh",
+                clean="rewritten clean",
+                raw="raw",
+            ),
+            {"prompt_tokens": 100, "completion_tokens": 200},
         )
 
-    def fake_embed(*args, **kwargs) -> np.ndarray:
+    def fake_embed(*args, **kwargs):
         texts = args[1]
-        return np.array([[1.0, 0.0]] * len(texts), dtype=np.float32)
+        return search_module.EmbeddingCallResult(
+            np.array([[1.0, 0.0]] * len(texts), dtype=np.float32),
+            {"input_count": len(texts)},
+        )
 
-    def fake_rerank(*args, **kwargs) -> list[float]:
-        return [0.8]
+    def fake_rerank(*args, **kwargs):
+        return search_module.RerankCallResult([0.8], {"pair_count": 1})
 
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
     monkeypatch.setattr(app_module, "index_state", lambda: state)
     monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
     monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
-    monkeypatch.setattr(search_module, "rewrite_query", fake_rewrite)
-    monkeypatch.setattr(search_module, "embed_texts", fake_embed)
-    monkeypatch.setattr(search_module, "rerank_documents", fake_rerank)
+    monkeypatch.setattr(search_module, "rewrite_query_with_usage", fake_rewrite)
+    monkeypatch.setattr(search_module, "embed_texts_with_usage", fake_embed)
+    monkeypatch.setattr(search_module, "rerank_documents_with_usage", fake_rerank)
 
     with TestClient(create_app()) as client:
         response = client.post(
@@ -125,6 +131,9 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
 
     assert audit["query"] == "hello"
     assert json.loads(audit["result"])["top"][0]["title"] == "Sample"
+    assert json.loads(audit["cost"])["microusd"] == 70
+    rewrite_call = json.loads(audit["api_calls"])[0]
+    assert rewrite_call["pricing"]["input_price_per_1m_tokens_microusd"] == 100000
 
 
 def test_search_requires_active_index(monkeypatch) -> None:
