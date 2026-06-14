@@ -18,7 +18,16 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from pydantic import BaseModel, Field
 
 from core import SRC_DIR, Settings, ensure_database, get_settings, verify_password
-from pipeline import confirm_import_job, create_import_dry_run, get_job, list_import_jobs
+from pipeline import (
+    confirm_import_job,
+    create_build_index_job,
+    create_import_dry_run,
+    execute_build_index_job,
+    get_index,
+    get_job,
+    list_import_jobs,
+    list_indexes,
+)
 from search import SearchIndex, search_events
 
 
@@ -151,6 +160,17 @@ def _decode_job(job: dict[str, Any]) -> dict[str, Any]:
                 decoded[key] = json.loads(value)
             except ValueError:
                 decoded[key] = value
+    return decoded
+
+
+def _decode_index(index: dict[str, Any]) -> dict[str, Any]:
+    decoded = dict(index)
+    value = decoded.get("meta")
+    if isinstance(value, str) and value:
+        try:
+            decoded["meta"] = json.loads(value)
+        except ValueError:
+            decoded["meta"] = value
     return decoded
 
 
@@ -293,6 +313,31 @@ def create_app() -> FastAPI:
         if job is None or job["type"] != "import":
             raise HTTPException(status_code=404, detail="Import job not found")
         return _decode_job(job)
+
+    @app.post("/admin/api/index/build")
+    def index_build(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+        del session
+        try:
+            job = create_build_index_job(settings())
+            return _decode_job(execute_build_index_job(job["key"], settings()))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/indexes")
+    def indexes(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+        del session
+        return {"items": [_decode_index(index) for index in list_indexes(settings())]}
+
+    @app.get("/admin/api/indexes/{index_key}")
+    def index_detail(
+        index_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        index = get_index(settings(), index_key)
+        if index is None:
+            raise HTTPException(status_code=404, detail="Index not found")
+        return _decode_index(index)
 
     @app.get("/admin/api/settings")
     def admin_settings(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:

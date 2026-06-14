@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import uuid
+import shutil
+import gc
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -10,12 +12,15 @@ from typing import Any, Literal
 import numpy as np
 
 from core import (
+    SCHEMA_VERSION,
     Settings,
     canonical_text,
     db_connection,
     embedding_key,
+    index_key,
     json_dumps,
     method_key,
+    row_hash,
     row_to_dict,
     rewrite_key,
     text_key,
@@ -672,6 +677,410 @@ def _store_embedding_batch(
                 )
 
 
+def create_build_index_job(settings: Settings) -> dict[str, Any]:
+    job_key = "j:" + uuid.uuid4().hex
+    selected_rewrite_method_key = rewrite_method_key(settings)
+    selected_embedding_method_key = embedding_method_key(settings)
+    snapshot_dir = settings.storage.index_cache_dir.parent / "builds" / _safe_path_key(job_key)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / "snapshot.jsonl"
+
+    snapshot = _read_enabled_problem_snapshot(settings)
+    with snapshot_path.open("w", encoding="utf-8", newline="\n") as f:
+        for row in snapshot:
+            f.write(json_dumps(row) + "\n")
+
+    now = utc_now()
+    payload = {
+        "snapshot_path": str(snapshot_path),
+        "rewrite_method_key": selected_rewrite_method_key,
+        "embedding_method_key": selected_embedding_method_key,
+        "problem_count": len(snapshot),
+    }
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                VALUES (?, 'build_index', 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    job_key,
+                    json_dumps(payload),
+                    json_dumps({"phase": "queued", "total": len(snapshot)}),
+                    now,
+                    now,
+                ),
+            )
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("build job was not created")
+    return job
+
+
+def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
+    with db_connection(settings) as conn:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE key = ? AND type = 'build_index'",
+            (job_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("build job not found")
+        job = row_to_dict(row)
+        if job["status"] != "queued":
+            raise ValueError("build job is not queued")
+        payload = json.loads(job["payload"])
+        with conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'running', progress = ?, updated_at = ?
+                WHERE key = ?
+                """,
+                (json_dumps({"phase": "artifacts"}), utc_now(), job_key),
+            )
+
+    snapshot = _read_snapshot(Path(payload["snapshot_path"]))
+    selected_rewrite_method_key = str(payload["rewrite_method_key"])
+    selected_embedding_method_key = str(payload["embedding_method_key"])
+    prepared: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for position, problem in enumerate(snapshot, start=1):
+        try:
+            rewrite = ensure_rewrite_artifact(
+                settings,
+                problem["text_key"],
+                selected_rewrite_method_key,
+            )
+            embeddings = ensure_embedding_artifacts(
+                settings,
+                rewrite["key"],
+                selected_embedding_method_key,
+            )
+            failed_embeddings = [
+                view for view, artifact in embeddings.items() if artifact["status"] != "succeeded"
+            ]
+            if failed_embeddings:
+                failures.append(
+                    {
+                        "problem_key": problem["key"],
+                        "error": f"embedding failed for views: {', '.join(failed_embeddings)}",
+                    }
+                )
+            else:
+                prepared.append({"problem": problem, "rewrite": rewrite, "embeddings": embeddings})
+        except Exception as exc:
+            failures.append({"problem_key": problem["key"], "error": str(exc)})
+
+        _update_job_progress(
+            settings,
+            job_key,
+            {
+                "phase": "artifacts",
+                "processed": position,
+                "total": len(snapshot),
+                "failures": len(failures),
+            },
+        )
+
+    if failures:
+        return _finish_job(settings, job_key, "blocked", {"failures": failures}, None)
+
+    rows, row_hashes = _build_index_rows(prepared)
+    selected_index_key = index_key(
+        row_hashes,
+        selected_rewrite_method_key,
+        selected_embedding_method_key,
+    )
+    cache_path = index_cache_path(settings, selected_index_key)
+    now = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO indexes(key, status, meta, created_at)
+                VALUES (?, 'building', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  status = 'building',
+                  meta = excluded.meta,
+                  error = NULL
+                """,
+                (
+                    selected_index_key,
+                    json_dumps(
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "rewrite_method_key": selected_rewrite_method_key,
+                            "embedding_method_key": selected_embedding_method_key,
+                            "problem_count": len(prepared),
+                            "cache_path": str(cache_path),
+                        }
+                    ),
+                    now,
+                ),
+            )
+            conn.execute("DELETE FROM index_rows WHERE index_key = ?", (selected_index_key,))
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO index_rows(
+                      index_key, problem_ord, problem_key, view, embedding_key,
+                      title, url, text_key, rewrite_key, row_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        selected_index_key,
+                        row["problem_ord"],
+                        row["problem_key"],
+                        row["view"],
+                        row["embedding_key"],
+                        row["title"],
+                        row["url"],
+                        row["text_key"],
+                        row["rewrite_key"],
+                        row["row_hash"],
+                    ),
+                )
+
+    try:
+        export_index_cache(settings, selected_index_key, prepared, cache_path)
+        verify_index_cache(cache_path, selected_index_key)
+        with db_connection(settings) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE indexes
+                    SET status = 'built', error = NULL
+                    WHERE key = ?
+                    """,
+                    (selected_index_key,),
+                )
+        return _finish_job(
+            settings,
+            job_key,
+            "succeeded",
+            {"index_key": selected_index_key, "cache_path": str(cache_path)},
+            None,
+        )
+    except Exception as exc:
+        with db_connection(settings) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE indexes SET status = 'failed', error = ? WHERE key = ?",
+                    (str(exc), selected_index_key),
+                )
+        return _finish_job(
+            settings,
+            job_key,
+            "failed",
+            {"index_key": selected_index_key},
+            str(exc),
+        )
+
+
+def list_indexes(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM indexes
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_index(settings: Settings, selected_index_key: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute("SELECT * FROM indexes WHERE key = ?", (selected_index_key,)).fetchone()
+        return row_to_dict(row) if row else None
+
+
+def index_cache_path(settings: Settings, selected_index_key: str) -> Path:
+    return settings.storage.index_cache_dir / _safe_path_key(selected_index_key)
+
+
+def export_index_cache(
+    settings: Settings,
+    selected_index_key: str,
+    prepared: list[dict[str, Any]],
+    cache_path: Path,
+) -> None:
+    building_root = settings.storage.index_cache_dir / ".building"
+    temp_path = building_root / _safe_path_key(selected_index_key)
+    if temp_path.exists():
+        shutil.rmtree(temp_path)
+    if cache_path.exists():
+        shutil.rmtree(cache_path)
+    temp_path.mkdir(parents=True, exist_ok=True)
+
+    problem_count = len(prepared)
+    dim = _embedding_dim(next(iter(prepared[0]["embeddings"].values()))) if prepared else 0
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "index_key": selected_index_key,
+        "problem_count": problem_count,
+        "views": list(VIEWS),
+        "dim": dim,
+        "dtype": "float32",
+        "files": {
+            "problems": "problems.jsonl",
+            "views": "views.jsonl",
+            **{view: f"{view}.npy" for view in VIEWS},
+        },
+    }
+
+    matrices = {
+        view: np.lib.format.open_memmap(
+            temp_path / f"{view}.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(problem_count, dim),
+        )
+        for view in VIEWS
+    }
+
+    with (temp_path / "problems.jsonl").open("w", encoding="utf-8", newline="\n") as problems_f, (
+        temp_path / "views.jsonl"
+    ).open("w", encoding="utf-8", newline="\n") as views_f:
+        for problem_ord, item in enumerate(prepared):
+            problem = item["problem"]
+            rewrite = item["rewrite"]
+            rewrite_data = json.loads(rewrite["data"])
+            problems_f.write(
+                json_dumps(
+                    {
+                        "ord": problem_ord,
+                        "key": problem["key"],
+                        "title": problem["title"],
+                        "url": problem["url"],
+                        "text_key": problem["text_key"],
+                        "rewrite_key": rewrite["key"],
+                    }
+                )
+                + "\n"
+            )
+            views_f.write(
+                json_dumps(
+                    {
+                        "ord": problem_ord,
+                        "key": problem["key"],
+                        **{view: rewrite_data[view] for view in VIEWS},
+                    }
+                )
+                + "\n"
+            )
+            for view in VIEWS:
+                vector = _artifact_vector(item["embeddings"][view])
+                matrices[view][problem_ord, :] = vector
+
+    for matrix in matrices.values():
+        matrix.flush()
+    del matrix
+    matrices.clear()
+    gc.collect()
+    (temp_path / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.rename(cache_path)
+
+
+def verify_index_cache(cache_path: Path, expected_index_key: str) -> None:
+    manifest_path = cache_path / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("cache manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("index_key") != expected_index_key:
+        raise ValueError("cache manifest index key mismatch")
+    problem_count = int(manifest["problem_count"])
+    dim = int(manifest["dim"])
+    for view in VIEWS:
+        matrix = np.load(cache_path / f"{view}.npy", mmap_mode="r")
+        if tuple(matrix.shape) != (problem_count, dim):
+            raise ValueError(f"cache matrix shape mismatch for {view}")
+        if matrix.dtype != np.float32:
+            raise ValueError(f"cache matrix dtype mismatch for {view}")
+
+
+def _read_enabled_problem_snapshot(settings: Settings) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT key, title, url, text_key
+            FROM problems
+            WHERE enabled = 1 AND deleted = 0
+            ORDER BY key
+            """
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def _read_snapshot(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _build_index_rows(prepared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    row_hashes: list[str] = []
+    for problem_ord, item in enumerate(prepared):
+        problem = item["problem"]
+        rewrite = item["rewrite"]
+        embeddings = item["embeddings"]
+        for view in VIEWS:
+            selected_embedding_key = embeddings[view]["key"]
+            selected_row_hash = row_hash(
+                problem_ord=problem_ord,
+                problem_key=problem["key"],
+                view=view,
+                row_embedding_key=selected_embedding_key,
+                title=problem["title"],
+                url=problem["url"],
+                row_text_key=problem["text_key"],
+                row_rewrite_key=rewrite["key"],
+            )
+            row_hashes.append(selected_row_hash)
+            rows.append(
+                {
+                    "problem_ord": problem_ord,
+                    "problem_key": problem["key"],
+                    "view": view,
+                    "embedding_key": selected_embedding_key,
+                    "title": problem["title"],
+                    "url": problem["url"],
+                    "text_key": problem["text_key"],
+                    "rewrite_key": rewrite["key"],
+                    "row_hash": selected_row_hash,
+                }
+            )
+    return rows, row_hashes
+
+
+def _embedding_dim(artifact: dict[str, Any]) -> int:
+    data = json.loads(artifact["data"])
+    return int(data["dim"])
+
+
+def _artifact_vector(artifact: dict[str, Any]) -> np.ndarray:
+    dim = _embedding_dim(artifact)
+    vector = np.frombuffer(artifact["blob"], dtype=np.float32)
+    if vector.shape != (dim,):
+        raise ValueError("embedding blob dimension mismatch")
+    return vector
+
+
+def _safe_path_key(key: str) -> str:
+    return key.replace(":", "_")
+
+
 def _update_job_progress(settings: Settings, job_key: str, progress: dict[str, Any]) -> None:
     with db_connection(settings) as conn:
         with conn:
@@ -684,7 +1093,7 @@ def _update_job_progress(settings: Settings, job_key: str, progress: dict[str, A
 def _finish_job(
     settings: Settings,
     job_key: str,
-    status: Literal["succeeded", "failed"],
+    status: Literal["succeeded", "blocked", "failed"],
     result: dict[str, Any],
     error: str | None,
 ) -> dict[str, Any]:
