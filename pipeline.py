@@ -7,7 +7,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from core import Settings, canonical_text, db_connection, json_dumps, row_to_dict, text_key, utc_now
+import numpy as np
+
+from core import (
+    Settings,
+    canonical_text,
+    db_connection,
+    embedding_key,
+    json_dumps,
+    method_key,
+    row_to_dict,
+    rewrite_key,
+    text_key,
+    utc_now,
+)
+from search import REWRITE_PROMPT, VIEWS, RewriteResult, embed_texts, normalize_matrix, rewrite_query
 
 
 ImportMode = Literal["upsert", "insert_only", "sync_source"]
@@ -48,6 +62,49 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def rewrite_method_key(settings: Settings) -> str:
+    return method_key(
+        "rewrite",
+        {
+            "model": settings.rewrite_model.model,
+            "url": settings.rewrite_model.url,
+            "api_key_env": settings.rewrite_model.api_key_env,
+            "prompt": REWRITE_PROMPT,
+            "views": list(VIEWS),
+        },
+    )
+
+
+def embedding_method_key(settings: Settings) -> str:
+    return method_key(
+        "embedding",
+        {
+            "model": settings.embedding_model.model,
+            "url": settings.embedding_model.url,
+            "api_key_env": settings.embedding_model.api_key_env,
+            "dtype": "float32",
+            "normalized": True,
+            "views": list(VIEWS),
+        },
+    )
+
+
+def _model_snapshot(settings: Settings, kind: Literal["rewrite", "embedding"]) -> dict[str, Any]:
+    model = settings.rewrite_model if kind == "rewrite" else settings.embedding_model
+    snapshot: dict[str, Any] = {
+        "model": model.model,
+        "url": model.url,
+        "api_key_env": model.api_key_env,
+    }
+    if kind == "rewrite":
+        snapshot["prompt"] = REWRITE_PROMPT
+        snapshot["views"] = list(VIEWS)
+    else:
+        snapshot["dtype"] = "float32"
+        snapshot["normalized"] = True
+    return snapshot
 
 
 def validate_import_row(raw: dict[str, Any], line_number: int, settings: Settings) -> ImportRow:
@@ -360,6 +417,259 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                     stats["disabled"] += cursor.rowcount
 
     return _finish_job(settings, job_key, "succeeded", stats, None)
+
+
+def ensure_rewrite_artifact(
+    settings: Settings,
+    problem_text_key: str,
+    selected_method_key: str | None = None,
+) -> dict[str, Any]:
+    selected_method_key = selected_method_key or rewrite_method_key(settings)
+    selected_rewrite_key = rewrite_key(problem_text_key, selected_method_key)
+
+    with db_connection(settings) as conn:
+        source = conn.execute(
+            "SELECT text FROM artifacts WHERE key = ? AND kind = 'problem_text'",
+            (problem_text_key,),
+        ).fetchone()
+        if source is None:
+            raise ValueError("problem text artifact not found")
+
+        now = utc_now()
+        with conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO artifacts(
+                  key, kind, parent_key, method_key, role, text, data, blob,
+                  status, attempts, error, updated_at
+                )
+                VALUES (?, 'rewrite', ?, ?, 'rewrite', NULL, NULL, NULL,
+                        'pending', 0, NULL, ?)
+                """,
+                (selected_rewrite_key, problem_text_key, selected_method_key, now),
+            )
+        artifact = row_to_dict(
+            conn.execute("SELECT * FROM artifacts WHERE key = ?", (selected_rewrite_key,)).fetchone()
+        )
+        if artifact["status"] == "succeeded":
+            return artifact
+        if artifact["status"] == "failed" and artifact["attempts"] >= settings.jobs.rewrite_max_attempts:
+            raise ValueError("rewrite artifact exceeded max attempts")
+
+        with conn:
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET status = 'running', attempts = attempts + 1, error = NULL, updated_at = ?
+                WHERE key = ?
+                """,
+                (utc_now(), selected_rewrite_key),
+            )
+
+    try:
+        rewrite = rewrite_query(
+            settings.rewrite_model,
+            source["text"],
+            timeout=settings.request_timeout,
+        )
+        payload = _rewrite_payload(rewrite, settings)
+        with db_connection(settings) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET status = 'succeeded', data = ?, error = NULL, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (json_dumps(payload), utc_now(), selected_rewrite_key),
+                )
+        artifact = get_artifact(settings, selected_rewrite_key)
+        if artifact is None:
+            raise ValueError("rewrite artifact disappeared")
+        return artifact
+    except Exception as exc:
+        _mark_artifact_failed(settings, selected_rewrite_key, str(exc))
+        raise
+
+
+def ensure_embedding_artifacts(
+    settings: Settings,
+    selected_rewrite_key: str,
+    selected_method_key: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    selected_method_key = selected_method_key or embedding_method_key(settings)
+    with db_connection(settings) as conn:
+        rewrite_row = conn.execute(
+            "SELECT data FROM artifacts WHERE key = ? AND kind = 'rewrite' AND status = 'succeeded'",
+            (selected_rewrite_key,),
+        ).fetchone()
+        if rewrite_row is None:
+            raise ValueError("succeeded rewrite artifact not found")
+        rewrite_data = json.loads(rewrite_row["data"])
+        view_texts = {view: str(rewrite_data.get(view) or "") for view in VIEWS}
+        if not all(view_texts.values()):
+            raise ValueError("rewrite artifact does not contain all views")
+
+        now = utc_now()
+        with conn:
+            for view in VIEWS:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO artifacts(
+                      key, kind, parent_key, method_key, role, text, data, blob,
+                      status, attempts, error, updated_at
+                    )
+                    VALUES (?, 'embedding', ?, ?, ?, NULL, NULL, NULL,
+                            'pending', 0, NULL, ?)
+                    """,
+                    (
+                        embedding_key(selected_rewrite_key, selected_method_key, view),
+                        selected_rewrite_key,
+                        selected_method_key,
+                        view,
+                        now,
+                    ),
+                )
+
+        artifacts = {
+            row["role"]: row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE kind = 'embedding'
+                  AND parent_key = ?
+                  AND method_key = ?
+                """,
+                (selected_rewrite_key, selected_method_key),
+            ).fetchall()
+        }
+
+    pending_views = [
+        view
+        for view in VIEWS
+        if artifacts[view]["status"] != "succeeded"
+        and artifacts[view]["attempts"] < settings.jobs.embedding_max_attempts
+    ]
+    if not pending_views:
+        return {view: artifacts[view] for view in VIEWS}
+
+    for start in range(0, len(pending_views), settings.jobs.embedding_batch_size):
+        batch_views = pending_views[start : start + settings.jobs.embedding_batch_size]
+        batch_keys = [
+            embedding_key(selected_rewrite_key, selected_method_key, view) for view in batch_views
+        ]
+        _mark_artifacts_running(settings, batch_keys)
+        try:
+            vectors = embed_texts(
+                settings.embedding_model,
+                [view_texts[view] for view in batch_views],
+                timeout=settings.request_timeout,
+            )
+            matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
+            _store_embedding_batch(
+                settings,
+                selected_rewrite_key,
+                selected_method_key,
+                batch_views,
+                matrix,
+            )
+        except Exception as exc:
+            for key in batch_keys:
+                _mark_artifact_failed(settings, key, str(exc))
+            raise
+
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM artifacts
+            WHERE kind = 'embedding'
+              AND parent_key = ?
+              AND method_key = ?
+            """,
+            (selected_rewrite_key, selected_method_key),
+        ).fetchall()
+    return {row["role"]: row_to_dict(row) for row in rows}
+
+
+def get_artifact(settings: Settings, artifact_key: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute("SELECT * FROM artifacts WHERE key = ?", (artifact_key,)).fetchone()
+        return row_to_dict(row) if row else None
+
+
+def _rewrite_payload(rewrite: RewriteResult, settings: Settings) -> dict[str, Any]:
+    clean = rewrite.clean or rewrite.statement
+    abstract_zh = rewrite.abstract_zh or rewrite.abstract
+    return {
+        "clean": clean,
+        "statement": rewrite.statement,
+        "abstract": rewrite.abstract,
+        "abstract_zh": abstract_zh,
+        "usage": None,
+        "method_snapshot": _model_snapshot(settings, "rewrite"),
+    }
+
+
+def _mark_artifact_failed(settings: Settings, artifact_key: str, error: str) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE key = ?
+                """,
+                (error[:4000], utc_now(), artifact_key),
+            )
+
+
+def _mark_artifacts_running(settings: Settings, artifact_keys: list[str]) -> None:
+    if not artifact_keys:
+        return
+    placeholders = ",".join("?" for _ in artifact_keys)
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                f"""
+                UPDATE artifacts
+                SET status = 'running', attempts = attempts + 1, error = NULL, updated_at = ?
+                WHERE key IN ({placeholders})
+                """,
+                [utc_now(), *artifact_keys],
+            )
+
+
+def _store_embedding_batch(
+    settings: Settings,
+    selected_rewrite_key: str,
+    selected_method_key: str,
+    views: list[str],
+    matrix: np.ndarray,
+) -> None:
+    now = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            for view, vector in zip(views, matrix, strict=True):
+                payload = {
+                    "dim": int(vector.shape[0]),
+                    "dtype": "float32",
+                    "normalized": True,
+                    "usage": None,
+                    "method_snapshot": _model_snapshot(settings, "embedding"),
+                }
+                conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET status = 'succeeded', data = ?, blob = ?, error = NULL, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        json_dumps(payload),
+                        np.asarray(vector, dtype=np.float32).tobytes(),
+                        now,
+                        embedding_key(selected_rewrite_key, selected_method_key, view),
+                    ),
+                )
 
 
 def _update_job_progress(settings: Settings, job_key: str, progress: dict[str, Any]) -> None:
