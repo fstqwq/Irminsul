@@ -29,7 +29,14 @@ from pipeline import (
     list_import_jobs,
     list_indexes,
 )
-from search import IndexState, SearchIndex, load_index_cache, search_events_loaded
+from search import (
+    IndexState,
+    SearchIndex,
+    get_search_audit,
+    list_search_audits,
+    load_index_cache,
+    search_events_loaded,
+)
 
 
 class SearchRequest(BaseModel):
@@ -228,6 +235,18 @@ def _decode_index(index: dict[str, Any]) -> dict[str, Any]:
     return decoded
 
 
+def _decode_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    decoded = dict(audit)
+    for key in ("timings", "api_calls", "result", "cost"):
+        value = decoded.get(key)
+        if isinstance(value, str) and value:
+            try:
+                decoded[key] = json.loads(value)
+            except ValueError:
+                decoded[key] = value
+    return decoded
+
+
 async def _store_upload(file: UploadFile, current_settings: Settings) -> Path:
     current_settings.storage.upload_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(file.filename or "upload.jsonl").suffix or ".jsonl"
@@ -293,16 +312,24 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/search")
-    def search(request: SearchRequest) -> StreamingResponse:
+    def search(payload: SearchRequest, request: Request) -> StreamingResponse:
         state = index_state()
         if state.switching:
             raise HTTPException(status_code=503, detail="Index is switching")
         if state.current is None:
             raise HTTPException(status_code=503, detail="Index is not loaded")
+        client_ip = request.client.host if request.client else ""
+        user_agent = request.headers.get("user-agent", "")
 
         def stream() -> Any:
             with state.search_snapshot() as loaded:
-                yield from search_events_loaded(request, settings(), loaded)
+                yield from search_events_loaded(
+                    payload,
+                    settings(),
+                    loaded,
+                    client_ip=client_ip,
+                    user_agent=user_agent,
+                )
 
         return StreamingResponse(
             stream(),
@@ -420,6 +447,22 @@ def create_app() -> FastAPI:
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")
         return _decode_index(index)
+
+    @app.get("/admin/api/audits")
+    def audits(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+        del session
+        return {"items": [_decode_audit(audit) for audit in list_search_audits(settings())]}
+
+    @app.get("/admin/api/audits/{request_id}")
+    def audit_detail(
+        request_id: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        audit = get_search_audit(settings(), request_id)
+        if audit is None:
+            raise HTTPException(status_code=404, detail="Audit not found")
+        return _decode_audit(audit)
 
     @app.get("/admin/api/settings")
     def admin_settings(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:

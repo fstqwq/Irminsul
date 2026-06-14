@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Iterator, Generator
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from typing import Any
 import numpy as np
 import requests
 
-from core import ModelConfig, SearchConfig, Settings
+from core import ModelConfig, SearchConfig, Settings, db_connection, json_dumps, row_to_dict, utc_now
 
 
 VIEWS = ("clean", "statement", "abstract", "abstract_zh")
@@ -605,9 +606,13 @@ def search_events_loaded(
     request: Any,
     settings: Settings,
     loaded_index: LoadedIndex,
+    client_ip: str = "",
+    user_agent: str = "",
 ) -> Iterator[str]:
     timings: dict[str, float | str] = {}
     search_config = settings.search
+    request_id = uuid.uuid4().hex
+    started_at = utc_now()
 
     try:
         edited_statement = (request.edited_statement or "").strip()
@@ -725,6 +730,21 @@ def search_events_loaded(
             search_config.rerank_range_floor,
             search_config.embedding_range_floor,
         )
+        result_summary = _audit_result_summary(fused)
+        write_search_audit(
+            settings=settings,
+            request_id=request_id,
+            started_at=started_at,
+            status="succeeded",
+            client_ip=client_ip,
+            user_agent=user_agent,
+            query=request.query_text,
+            timings=timings,
+            api_calls=[],
+            result=result_summary,
+            cost={"microusd": 0},
+            error=None,
+        )
         yield ndjson_event(
             "candidates",
             candidates=[asdict(candidate) for candidate in fused],
@@ -732,7 +752,101 @@ def search_events_loaded(
         )
         yield ndjson_event("done")
     except Exception as exc:
+        write_search_audit(
+            settings=settings,
+            request_id=request_id,
+            started_at=started_at,
+            status="failed",
+            client_ip=client_ip,
+            user_agent=user_agent,
+            query=getattr(request, "query_text", ""),
+            timings=timings,
+            api_calls=[],
+            result={"candidates": []},
+            cost={"microusd": 0},
+            error=str(exc),
+        )
         yield ndjson_event("error", message=str(exc))
+
+
+def write_search_audit(
+    settings: Settings,
+    request_id: str,
+    started_at: str,
+    status: str,
+    client_ip: str,
+    user_agent: str,
+    query: str,
+    timings: dict[str, float | str],
+    api_calls: list[dict[str, Any]],
+    result: dict[str, Any],
+    cost: dict[str, Any],
+    error: str | None,
+) -> None:
+    finished_at = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO search_audits(
+                  request_id, started_at, finished_at, status, client_ip, user_agent,
+                  query, timings, api_calls, result, cost, error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    started_at,
+                    finished_at,
+                    status,
+                    client_ip,
+                    user_agent,
+                    query,
+                    json_dumps(timings),
+                    json_dumps(api_calls),
+                    json_dumps(result),
+                    json_dumps(cost),
+                    error,
+                ),
+            )
+
+
+def list_search_audits(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM search_audits
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_search_audit(settings: Settings, request_id: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute(
+            "SELECT * FROM search_audits WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def _audit_result_summary(candidates: list[Candidate]) -> dict[str, Any]:
+    return {
+        "candidate_count": len(candidates),
+        "top": [
+            {
+                "problem_id": candidate.problem_id,
+                "title": candidate.title,
+                "embedding_score": candidate.embedding_score,
+                "rerank_score": candidate.rerank_score,
+                "final_score": candidate.final_score,
+            }
+            for candidate in candidates[:20]
+        ],
+    }
 
 
 def ndjson_event(event_type: str, **payload: Any) -> str:

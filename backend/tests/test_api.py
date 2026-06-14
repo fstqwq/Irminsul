@@ -26,8 +26,18 @@ def test_health_and_config() -> None:
     assert config.json()["top_display"] == 20
 
 
-def test_search_stream_with_mocks(monkeypatch) -> None:
+def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
     import search as search_module
+
+    base_settings = get_settings()
+    storage = replace(
+        base_settings.storage,
+        db_path=tmp_path / "app.sqlite3",
+        upload_dir=tmp_path / "uploads",
+        index_cache_dir=tmp_path / "index_cache",
+    )
+    test_settings = replace(base_settings, storage=storage)
+    ensure_database(test_settings)
 
     state = IndexState()
     state.current = search_module.LoadedIndex(
@@ -68,24 +78,40 @@ def test_search_stream_with_mocks(monkeypatch) -> None:
     def fake_rerank(*args, **kwargs) -> list[float]:
         return [0.8]
 
-    app = create_app()
-    app.dependency_overrides = {}
+    monkeypatch.setattr(app_module, "settings", lambda: test_settings)
     monkeypatch.setattr(app_module, "index_state", lambda: state)
+    monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
+    monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
     monkeypatch.setattr(search_module, "rewrite_query", fake_rewrite)
     monkeypatch.setattr(search_module, "embed_texts", fake_embed)
     monkeypatch.setattr(search_module, "rerank_documents", fake_rerank)
-    client = TestClient(app)
 
-    response = client.post(
-        "/api/search",
-        json={"query_text": "hello", "use_rewrite": True, "use_rerank": True},
-    )
-    events = [json.loads(line) for line in response.text.splitlines()]
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/search",
+            json={"query_text": "hello", "use_rewrite": True, "use_rerank": True},
+        )
+        events = [json.loads(line) for line in response.text.splitlines()]
 
-    assert response.status_code == 200
-    assert [event["type"] for event in events][-2:] == ["candidates", "done"]
-    assert any(event["type"] == "rewrite" for event in events)
-    assert events[-2]["candidates"][0]["title"] == "Sample"
+        assert response.status_code == 200
+        assert [event["type"] for event in events][-2:] == ["candidates", "done"]
+        assert any(event["type"] == "rewrite" for event in events)
+        assert events[-2]["candidates"][0]["title"] == "Sample"
+
+        login = client.post("/admin/api/auth/login", json={"password": "secret"})
+        csrf = client.cookies.get("admin_csrf")
+        assert login.status_code == 200
+        assert csrf
+        audits = client.get("/admin/api/audits")
+        assert audits.status_code == 200
+        assert audits.json()["items"][0]["query"] == "hello"
+        assert audits.json()["items"][0]["status"] == "succeeded"
+
+    with db_connection(test_settings) as conn:
+        audit = conn.execute("SELECT * FROM search_audits").fetchone()
+
+    assert audit["query"] == "hello"
+    assert json.loads(audit["result"])["top"][0]["title"] == "Sample"
 
 
 def test_search_requires_active_index(monkeypatch) -> None:
