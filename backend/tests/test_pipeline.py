@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import gc
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from pipeline import (
     ensure_rewrite_artifact,
     execute_build_index_job,
     index_cache_path,
+    rebuild_index_cache,
 )
 from search import IndexState, RewriteResult, load_index_cache
 
@@ -158,13 +161,17 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
 
     assert finished["status"] == "succeeded"
     assert (cache_path / "manifest.json").exists()
-    assert np.load(cache_path / "clean.npy", mmap_mode="r").shape == (1, 2)
+    assert np.load(cache_path / "clean.npy").shape == (1, 2)
     loaded = load_index_cache(cache_path, "mmap")
     state = IndexState()
     state.activate(loaded, 1)
     with state.search_snapshot() as snapshot:
         assert snapshot.key == index_key
         assert snapshot.problem_count == 1
+    state.current = None
+    del snapshot
+    del loaded
+    gc.collect()
 
     with db_connection(settings) as conn:
         index = conn.execute("SELECT * FROM indexes WHERE key = ?", (index_key,)).fetchone()
@@ -175,3 +182,8 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
 
     assert index["status"] == "built"
     assert row_count == 4
+
+    shutil.rmtree(cache_path)
+    rebuilt = rebuild_index_cache(settings, index_key)
+    assert rebuilt["status"] == "built"
+    assert np.load(cache_path / "statement.npy", mmap_mode="r").shape == (1, 2)

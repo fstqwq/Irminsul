@@ -973,12 +973,16 @@ def export_index_cache(
     selected_index_key: str,
     prepared: list[dict[str, Any]],
     cache_path: Path,
+    force: bool = False,
 ) -> None:
     building_root = settings.storage.index_cache_dir / ".building"
     temp_path = building_root / _safe_path_key(selected_index_key)
     if temp_path.exists():
         shutil.rmtree(temp_path)
     if cache_path.exists():
+        if not force:
+            verify_index_cache(cache_path, selected_index_key)
+            return
         shutil.rmtree(cache_path)
     temp_path.mkdir(parents=True, exist_ok=True)
 
@@ -1071,6 +1075,32 @@ def verify_index_cache(cache_path: Path, expected_index_key: str) -> None:
             raise ValueError(f"cache matrix dtype mismatch for {view}")
 
 
+def rebuild_index_cache(settings: Settings, selected_index_key: str) -> dict[str, Any]:
+    index = get_index(settings, selected_index_key)
+    if index is None:
+        raise ValueError("index not found")
+    if index["status"] == "active":
+        raise ValueError("cannot rebuild cache for active index")
+    prepared = _prepared_from_index_rows(settings, selected_index_key)
+    cache_path = index_cache_path(settings, selected_index_key)
+    export_index_cache(settings, selected_index_key, prepared, cache_path, force=True)
+    verify_index_cache(cache_path, selected_index_key)
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE indexes
+                SET status = 'built', error = NULL
+                WHERE key = ?
+                """,
+                (selected_index_key,),
+            )
+    refreshed = get_index(settings, selected_index_key)
+    if refreshed is None:
+        raise ValueError("index not found after cache rebuild")
+    return refreshed
+
+
 def _read_enabled_problem_snapshot(settings: Settings) -> list[dict[str, Any]]:
     with db_connection(settings) as conn:
         rows = conn.execute(
@@ -1127,6 +1157,67 @@ def _build_index_rows(prepared: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 }
             )
     return rows, row_hashes
+
+
+def _prepared_from_index_rows(settings: Settings, selected_index_key: str) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM index_rows
+            WHERE index_key = ?
+            ORDER BY problem_ord, view
+            """,
+            (selected_index_key,),
+        ).fetchall()
+        artifacts = {
+            row["key"]: row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT a.*
+                FROM artifacts a
+                WHERE a.key IN (
+                  SELECT rewrite_key FROM index_rows WHERE index_key = ?
+                  UNION
+                  SELECT embedding_key FROM index_rows WHERE index_key = ?
+                )
+                """,
+                (selected_index_key, selected_index_key),
+            ).fetchall()
+        }
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["problem_ord"]), []).append(row_to_dict(row))
+
+    prepared: list[dict[str, Any]] = []
+    for problem_ord in sorted(grouped):
+        problem_rows = grouped[problem_ord]
+        first = problem_rows[0]
+        rewrite = artifacts.get(first["rewrite_key"])
+        if rewrite is None:
+            raise ValueError("rewrite artifact missing for index row")
+        embeddings: dict[str, dict[str, Any]] = {}
+        for row in problem_rows:
+            embedding = artifacts.get(row["embedding_key"])
+            if embedding is None:
+                raise ValueError("embedding artifact missing for index row")
+            embeddings[row["view"]] = embedding
+        if set(embeddings) != set(VIEWS):
+            raise ValueError("index rows do not contain all views")
+        prepared.append(
+            {
+                "problem": {
+                    "key": first["problem_key"],
+                    "title": first["title"],
+                    "url": first["url"],
+                    "text_key": first["text_key"],
+                },
+                "rewrite": rewrite,
+                "embeddings": embeddings,
+            }
+        )
+    return prepared
 
 
 def _embedding_dim(artifact: dict[str, Any]) -> int:

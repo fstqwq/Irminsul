@@ -36,7 +36,9 @@ from pipeline import (
     patch_problem,
     patch_source,
     recover_startup,
+    rebuild_index_cache,
     retry_job,
+    verify_index_cache,
 )
 from search import (
     IndexState,
@@ -571,6 +573,29 @@ def create_app() -> FastAPI:
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")
         return _decode_index(index)
+
+    @app.post("/admin/api/index/{index_key}/cache/rebuild")
+    def index_cache_rebuild(
+        index_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return _decode_index(rebuild_index_cache(settings(), index_key))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/admin/api/index/{index_key}/verify")
+    def index_verify(
+        index_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            verify_index_cache(index_cache_path(settings(), index_key), index_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "index_key": index_key}
 
     @app.get("/admin/api/audits")
     def audits(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
