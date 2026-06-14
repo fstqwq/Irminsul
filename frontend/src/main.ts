@@ -3,6 +3,7 @@ import "@fontsource/ibm-plex-mono/latin-400.css";
 import "@fontsource/ibm-plex-mono/latin-500.css";
 import "temml/dist/Temml-Local.css";
 import { fetchConfig, streamSearch, type StreamEvent } from "./api";
+import { startAdmin } from "./admin";
 import { renderApp, type Actions } from "./render";
 import { createInitialState, initialStages, stageOrder, type SortMode } from "./state";
 import "./styles.css";
@@ -11,6 +12,13 @@ const root = document.getElementById("root");
 if (!root) throw new Error("Missing #root");
 const appRoot = root;
 
+if (window.location.pathname.startsWith("/admin")) {
+  startAdmin(appRoot);
+} else {
+  startSearchApp();
+}
+
+function startSearchApp(): void {
 const state = createInitialState();
 let abortController: AbortController | null = null;
 
@@ -176,3 +184,4 @@ fetchConfig()
   .catch(() => {
     render();
   });
+}

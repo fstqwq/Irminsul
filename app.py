@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 from pydantic import BaseModel, Field
@@ -606,6 +606,13 @@ def create_app() -> FastAPI:
 
     frontend_dist = SRC_DIR / "frontend" / "dist"
     if frontend_dist.exists():
+
+        @app.get("/admin")
+        @app.get("/admin/{path:path}")
+        def admin_frontend(path: str = "") -> FileResponse:
+            del path
+            return FileResponse(frontend_dist / "index.html")
+
         app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
     else:
 
