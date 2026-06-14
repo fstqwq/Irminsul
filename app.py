@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from core import SRC_DIR, Settings, db_connection, ensure_database, get_settings, utc_now, verify_password
 from pipeline import (
+    batch_update_problems,
     confirm_import_job,
     create_build_index_job,
     create_import_dry_run,
@@ -26,8 +27,14 @@ from pipeline import (
     get_index,
     get_job,
     index_cache_path,
+    list_jobs,
     list_import_jobs,
     list_indexes,
+    list_problems,
+    list_sources,
+    patch_problem,
+    patch_source,
+    retry_job,
 )
 from search import (
     IndexState,
@@ -51,6 +58,22 @@ class SearchRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1)
+
+
+class ProblemPatch(BaseModel):
+    title: str | None = None
+    url: str | None = None
+    enabled: bool | None = None
+    deleted: bool | None = None
+
+
+class ProblemBatchRequest(BaseModel):
+    keys: list[str] = Field(min_length=1)
+
+
+class SourcePatch(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
 
 
 @lru_cache(maxsize=1)
@@ -366,6 +389,60 @@ def create_app() -> FastAPI:
             "today_searches": 0,
         }
 
+    @app.get("/admin/api/problems")
+    def problems(
+        source_key: str | None = None,
+        enabled: bool | None = None,
+        deleted: bool | None = None,
+        q: str = "",
+        limit: int = 50,
+        offset: int = 0,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        return list_problems(settings(), source_key, enabled, deleted, q, limit, offset)
+
+    @app.post("/admin/api/problems/batch-{action}")
+    def problems_batch(
+        action: str,
+        payload: ProblemBatchRequest,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return batch_update_problems(settings(), payload.keys, action)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/admin/api/problems/{problem_key:path}")
+    def problem_patch(
+        problem_key: str,
+        payload: ProblemPatch,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return patch_problem(settings(), problem_key, payload.model_dump(exclude_unset=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/sources")
+    def sources(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+        del session
+        return {"items": list_sources(settings())}
+
+    @app.patch("/admin/api/sources/{source_key}")
+    def source_patch(
+        source_key: str,
+        payload: SourcePatch,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return patch_source(settings(), source_key, payload.model_dump(exclude_unset=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/admin/api/import/dry-run")
     async def import_dry_run(
         file: UploadFile = File(...),
@@ -407,6 +484,38 @@ def create_app() -> FastAPI:
         if job is None or job["type"] != "import":
             raise HTTPException(status_code=404, detail="Import job not found")
         return _decode_job(job)
+
+    @app.get("/admin/api/jobs")
+    def jobs(
+        type: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        return {"items": [_decode_job(job) for job in list_jobs(settings(), type, status, limit)]}
+
+    @app.get("/admin/api/jobs/{job_key}")
+    def job_detail(
+        job_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        job = get_job(settings(), job_key)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _decode_job(job)
+
+    @app.post("/admin/api/jobs/{job_key}/retry")
+    def job_retry(
+        job_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return _decode_job(retry_job(settings(), job_key))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/admin/api/index/build")
     def index_build(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:

@@ -173,6 +173,43 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         assert job["status"] == "succeeded"
         assert job["result"]["new"] == 1
 
+        problems = client.get("/admin/api/problems")
+        assert problems.status_code == 200
+        assert problems.json()["total"] == 1
+        assert problems.json()["items"][0]["title"] == "Theatre Square"
+
+        patched_problem = client.patch(
+            "/admin/api/problems/CodeForces/1A",
+            json={"title": "Updated Theatre Square"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert patched_problem.status_code == 200
+        assert patched_problem.json()["title"] == "Updated Theatre Square"
+
+        sources = client.get("/admin/api/sources")
+        assert sources.status_code == 200
+        assert sources.json()["items"][0]["problem_count"] == 1
+
+        patched_source = client.patch(
+            "/admin/api/sources/CodeForces",
+            json={"name": "CodeForces Archive"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert patched_source.status_code == 200
+        assert patched_source.json()["name"] == "CodeForces Archive"
+
+        batch = client.post(
+            "/admin/api/problems/batch-disable",
+            json={"keys": ["CodeForces/1A"]},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert batch.status_code == 200
+        assert batch.json()["updated"] == 1
+
+        jobs = client.get("/admin/api/jobs?type=import")
+        assert jobs.status_code == 200
+        assert jobs.json()["items"][0]["key"] == payload["job_key"]
+
     with db_connection(test_settings) as conn:
         source = conn.execute("SELECT * FROM sources WHERE key = 'CodeForces'").fetchone()
         problem = conn.execute("SELECT * FROM problems WHERE key = 'CodeForces/1A'").fetchone()
@@ -182,7 +219,9 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         ).fetchone()
 
     assert source is not None
-    assert problem["title"] == "Theatre Square"
+    assert source["name"] == "CodeForces Archive"
+    assert problem["title"] == "Updated Theatre Square"
+    assert problem["enabled"] == 0
     assert artifact["kind"] == "problem_text"
 
 

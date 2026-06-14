@@ -1081,6 +1081,199 @@ def _safe_path_key(key: str) -> str:
     return key.replace(":", "_")
 
 
+def list_problems(
+    settings: Settings,
+    source_key: str | None = None,
+    enabled: bool | None = None,
+    deleted: bool | None = None,
+    q: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    if source_key:
+        where.append("source_key = ?")
+        params.append(source_key)
+    if enabled is not None:
+        where.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    if deleted is not None:
+        where.append("deleted = ?")
+        params.append(1 if deleted else 0)
+    if q.strip():
+        where.append("(key LIKE ? OR title LIKE ? OR url LIKE ?)")
+        needle = f"%{q.strip()}%"
+        params.extend([needle, needle, needle])
+
+    where_sql = " AND ".join(where)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    with db_connection(settings) as conn:
+        total = conn.execute(
+            f"SELECT count(*) FROM problems WHERE {where_sql}",
+            params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT key, source_key, title, url, text_key, enabled, deleted, updated_at
+            FROM problems
+            WHERE {where_sql}
+            ORDER BY updated_at DESC, key
+            LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+    return {"total": total, "items": [row_to_dict(row) for row in rows]}
+
+
+def patch_problem(settings: Settings, problem_key: str, changes: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"title", "url", "enabled", "deleted"}
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in changes.items():
+        if key not in allowed or value is None:
+            continue
+        assignments.append(f"{key} = ?")
+        params.append(int(value) if key in {"enabled", "deleted"} else str(value))
+    if not assignments:
+        raise ValueError("no valid problem changes")
+    assignments.append("updated_at = ?")
+    params.extend([utc_now(), problem_key])
+    with db_connection(settings) as conn:
+        with conn:
+            cursor = conn.execute(
+                f"UPDATE problems SET {', '.join(assignments)} WHERE key = ?",
+                params,
+            )
+        if cursor.rowcount == 0:
+            raise ValueError("problem not found")
+        row = conn.execute("SELECT * FROM problems WHERE key = ?", (problem_key,)).fetchone()
+    return row_to_dict(row)
+
+
+def batch_update_problems(settings: Settings, keys: list[str], action: str) -> dict[str, Any]:
+    if not keys:
+        raise ValueError("keys are required")
+    if action not in {"enable", "disable", "delete", "restore"}:
+        raise ValueError("invalid batch action")
+    if action == "enable":
+        assignments = "enabled = 1"
+    elif action == "disable":
+        assignments = "enabled = 0"
+    elif action == "delete":
+        assignments = "deleted = 1"
+    else:
+        assignments = "deleted = 0"
+
+    placeholders = ",".join("?" for _ in keys)
+    with db_connection(settings) as conn:
+        with conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE problems
+                SET {assignments}, updated_at = ?
+                WHERE key IN ({placeholders})
+                """,
+                [utc_now(), *keys],
+            )
+    return {"updated": cursor.rowcount}
+
+
+def list_sources(settings: Settings) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              s.key, s.name, s.enabled, s.updated_at,
+              count(p.key) AS problem_count,
+              sum(CASE WHEN p.enabled = 1 AND p.deleted = 0 THEN 1 ELSE 0 END) AS active_count,
+              sum(CASE WHEN p.deleted = 1 THEN 1 ELSE 0 END) AS deleted_count
+            FROM sources s
+            LEFT JOIN problems p ON p.source_key = s.key
+            GROUP BY s.key, s.name, s.enabled, s.updated_at
+            ORDER BY s.key
+            """
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def patch_source(settings: Settings, source_key: str, changes: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"name", "enabled"}
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in changes.items():
+        if key not in allowed or value is None:
+            continue
+        assignments.append(f"{key} = ?")
+        params.append(int(value) if key == "enabled" else str(value))
+    if not assignments:
+        raise ValueError("no valid source changes")
+    assignments.append("updated_at = ?")
+    params.extend([utc_now(), source_key])
+    with db_connection(settings) as conn:
+        with conn:
+            cursor = conn.execute(
+                f"UPDATE sources SET {', '.join(assignments)} WHERE key = ?",
+                params,
+            )
+        if cursor.rowcount == 0:
+            raise ValueError("source not found")
+        row = conn.execute("SELECT * FROM sources WHERE key = ?", (source_key,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_jobs(
+    settings: Settings,
+    job_type: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    if job_type:
+        where.append("type = ?")
+        params.append(job_type)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    limit = max(1, min(limit, 500))
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("job not found")
+    if job["status"] not in {"blocked", "failed"}:
+        raise ValueError("job is not retryable")
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued', error = NULL, updated_at = ?
+                WHERE key = ?
+                """,
+                (utc_now(), job_key),
+            )
+    if job["type"] == "build_index":
+        return execute_build_index_job(job_key, settings)
+    if job["type"] == "import":
+        return execute_import_job(job_key, settings)
+    return get_job(settings, job_key) or job
+
+
 def _update_job_progress(settings: Settings, job_key: str, progress: dict[str, Any]) -> None:
     with db_connection(settings) as conn:
         with conn:
