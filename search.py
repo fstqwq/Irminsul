@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
@@ -70,6 +72,41 @@ class IndexState:
         self.inflight_searches = 0
         self.condition = threading.Condition()
 
+    @contextmanager
+    def search_snapshot(self) -> Generator[LoadedIndex, None, None]:
+        with self.condition:
+            if self.switching:
+                raise RuntimeError("index is switching")
+            if self.current is None:
+                raise RuntimeError("index is not loaded")
+            self.inflight_searches += 1
+            current = self.current
+        try:
+            yield current
+        finally:
+            with self.condition:
+                self.inflight_searches -= 1
+                self.condition.notify_all()
+
+    def activate(self, new_index: LoadedIndex, drain_timeout_seconds: int) -> LoadedIndex | None:
+        deadline = time.monotonic() + drain_timeout_seconds
+        with self.condition:
+            if self.switching:
+                raise RuntimeError("index is already switching")
+            self.switching = True
+            try:
+                while self.inflight_searches > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out waiting for in-flight searches")
+                    self.condition.wait(timeout=remaining)
+                old_index = self.current
+                self.current = new_index
+                return old_index
+            finally:
+                self.switching = False
+                self.condition.notify_all()
+
 
 class RewriteFormatError(ValueError):
     pass
@@ -99,6 +136,44 @@ def read_jsonl_list(path: Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def load_index_cache(cache_path: Path, load_mode: str = "mmap") -> LoadedIndex:
+    manifest_path = cache_path / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("cache manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    index_key = str(manifest["index_key"])
+    views = tuple(manifest["views"])
+    if views != VIEWS:
+        raise ValueError("cache views do not match runtime views")
+    problem_count = int(manifest["problem_count"])
+    dim = int(manifest["dim"])
+    mmap_mode = "r" if load_mode == "mmap" else None
+
+    problems = read_jsonl_list(cache_path / "problems.jsonl")
+    view_rows = read_jsonl_list(cache_path / "views.jsonl")
+    if len(problems) != problem_count or len(view_rows) != problem_count:
+        raise ValueError("cache metadata row count mismatch")
+
+    matrices: dict[str, np.ndarray] = {}
+    for view in VIEWS:
+        matrix = np.load(cache_path / f"{view}.npy", mmap_mode=mmap_mode)
+        if matrix.shape != (problem_count, dim):
+            raise ValueError(f"cache matrix shape mismatch for {view}")
+        if matrix.dtype != np.float32:
+            raise ValueError(f"cache matrix dtype mismatch for {view}")
+        matrices[view] = matrix
+
+    return LoadedIndex(
+        key=index_key,
+        problem_keys=[str(row["key"]) for row in problems],
+        titles=[str(row["title"]) for row in problems],
+        urls=[str(row["url"]) for row in problems],
+        texts={view: [str(row[view]) for row in view_rows] for view in VIEWS},
+        matrices=matrices,
+        load_mode=load_mode,
+    )
 
 
 def top_indices(scores: np.ndarray, k: int) -> np.ndarray:

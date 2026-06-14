@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 from pydantic import BaseModel, Field
 
-from core import SRC_DIR, Settings, ensure_database, get_settings, verify_password
+from core import SRC_DIR, Settings, db_connection, ensure_database, get_settings, utc_now, verify_password
 from pipeline import (
     confirm_import_job,
     create_build_index_job,
@@ -25,10 +25,11 @@ from pipeline import (
     execute_build_index_job,
     get_index,
     get_job,
+    index_cache_path,
     list_import_jobs,
     list_indexes,
 )
-from search import SearchIndex, search_events
+from search import IndexState, SearchIndex, load_index_cache, search_events
 
 
 class SearchRequest(BaseModel):
@@ -53,6 +54,11 @@ def settings() -> Settings:
 @lru_cache(maxsize=1)
 def legacy_index() -> SearchIndex:
     return SearchIndex(settings().data_dir)
+
+
+@lru_cache(maxsize=1)
+def index_state() -> IndexState:
+    return IndexState()
 
 
 def _admin_secret(current_settings: Settings) -> str:
@@ -151,6 +157,54 @@ def _clear_session_cookies(response: Response) -> None:
     response.delete_cookie("admin_csrf")
 
 
+def _load_active_index(current_settings: Settings, state: IndexState) -> None:
+    with db_connection(current_settings) as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key = 'active_index_key'").fetchone()
+    if row is None:
+        return
+    selected_index_key = row["value"]
+    loaded = load_index_cache(
+        index_cache_path(current_settings, selected_index_key),
+        current_settings.index_cache.load_mode,
+    )
+    state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
+
+
+def _activate_index(current_settings: Settings, selected_index_key: str, state: IndexState) -> None:
+    index = get_index(current_settings, selected_index_key)
+    if index is None:
+        raise ValueError("index not found")
+    if index["status"] not in {"built", "active", "retired"}:
+        raise ValueError("index is not built")
+    loaded = load_index_cache(
+        index_cache_path(current_settings, selected_index_key),
+        current_settings.index_cache.load_mode,
+    )
+    state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
+    now = utc_now()
+    with db_connection(current_settings) as conn:
+        with conn:
+            conn.execute("UPDATE indexes SET status = 'retired' WHERE status = 'active'")
+            conn.execute(
+                """
+                UPDATE indexes
+                SET status = 'active', activated_at = ?, error = NULL
+                WHERE key = ?
+                """,
+                (now, selected_index_key),
+            )
+            conn.execute(
+                """
+                INSERT INTO kv(key, value, updated_at)
+                VALUES ('active_index_key', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value,
+                  updated_at = excluded.updated_at
+                """,
+                (selected_index_key, now),
+            )
+
+
 def _decode_job(job: dict[str, Any]) -> dict[str, Any]:
     decoded = dict(job)
     for key in ("payload", "progress", "result"):
@@ -193,11 +247,12 @@ async def _store_upload(file: UploadFile, current_settings: Settings) -> Path:
         path.unlink(missing_ok=True)
         raise
 
-
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        ensure_database(settings())
+        current_settings = settings()
+        ensure_database(current_settings)
+        _load_active_index(current_settings, index_state())
         yield
 
     app = FastAPI(title="Yuantiji", version="0.2.0", lifespan=lifespan)
@@ -212,16 +267,18 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         current_settings = settings()
-        current_index = legacy_index()
+        state = index_state()
+        active_index = state.current
+        current_index = None if active_index else legacy_index()
         return {
             "ok": True,
-            "loaded_index_key": None,
-            "problem_count": current_index.corpus_count,
-            "embedding_shape": current_index.embedding_shape,
-            "views": ["statement", "abstract"],
-            "switching": False,
+            "loaded_index_key": active_index.key if active_index else None,
+            "problem_count": active_index.problem_count if active_index else current_index.corpus_count,
+            "embedding_shape": active_index.embedding_shape if active_index else current_index.embedding_shape,
+            "views": list(active_index.texts.keys()) if active_index else ["statement", "abstract"],
+            "switching": state.switching,
             "data_dir": str(current_settings.data_dir),
-            "corpus_count": current_index.corpus_count,
+            "corpus_count": active_index.problem_count if active_index else current_index.corpus_count,
         }
 
     @app.get("/api/config")
@@ -334,6 +391,21 @@ def create_app() -> FastAPI:
         session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
         del session
+        index = get_index(settings(), index_key)
+        if index is None:
+            raise HTTPException(status_code=404, detail="Index not found")
+        return _decode_index(index)
+
+    @app.post("/admin/api/index/{index_key}/activate")
+    def index_activate(
+        index_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            _activate_index(settings(), index_key, index_state())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         index = get_index(settings(), index_key)
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")

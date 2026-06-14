@@ -4,12 +4,13 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 from fastapi.testclient import TestClient
 
 import app as app_module
 from app import create_app
-from core import db_connection, get_settings, hash_password
-from search import Candidate
+from core import db_connection, ensure_database, get_settings, hash_password, text_key, utc_now
+from search import Candidate, IndexState, RewriteResult
 
 
 def test_health_and_config() -> None:
@@ -133,3 +134,91 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
     assert source is not None
     assert problem["title"] == "Theatre Square"
     assert artifact["kind"] == "problem_text"
+
+
+def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
+    import pipeline
+
+    base_settings = get_settings()
+    storage = replace(
+        base_settings.storage,
+        db_path=tmp_path / "app.sqlite3",
+        upload_dir=tmp_path / "uploads",
+        index_cache_dir=tmp_path / "index_cache",
+    )
+    test_settings = replace(base_settings, storage=storage)
+    ensure_database(test_settings)
+    state = IndexState()
+    monkeypatch.setattr(app_module, "settings", lambda: test_settings)
+    monkeypatch.setattr(app_module, "index_state", lambda: state)
+    monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
+    monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
+
+    problem_text = "Build through API."
+    problem_text_key = text_key(problem_text)
+    with db_connection(test_settings) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO sources(key, name, updated_at) VALUES ('CF', 'CF', ?)",
+                (utc_now(),),
+            )
+            conn.execute(
+                """
+                INSERT INTO artifacts(key, kind, text, status, attempts, updated_at)
+                VALUES (?, 'problem_text', ?, 'succeeded', 0, ?)
+                """,
+                (problem_text_key, problem_text, utc_now()),
+            )
+            conn.execute(
+                """
+                INSERT INTO problems(key, source_key, title, url, text_key, updated_at)
+                VALUES ('CF/2A', 'CF', 'API Build', 'https://example.com/2A', ?, ?)
+                """,
+                (problem_text_key, utc_now()),
+            )
+
+    def fake_rewrite(*args, **kwargs) -> RewriteResult:
+        return RewriteResult(
+            statement="Statement view",
+            abstract="Abstract view",
+            abstract_zh="Chinese abstract",
+            clean="Clean view",
+            raw="raw",
+        )
+
+    def fake_embed(*args, **kwargs) -> np.ndarray:
+        texts = args[1]
+        return np.array(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.5, 0.5],
+            ],
+            dtype=np.float32,
+        )[: len(texts)]
+
+    monkeypatch.setattr(pipeline, "rewrite_query", fake_rewrite)
+    monkeypatch.setattr(pipeline, "embed_texts", fake_embed)
+
+    with TestClient(create_app()) as client:
+        login = client.post("/admin/api/auth/login", json={"password": "secret"})
+        csrf = client.cookies.get("admin_csrf")
+        assert login.status_code == 200
+        assert csrf
+
+        build = client.post("/admin/api/index/build", headers={"X-CSRF-Token": csrf})
+        assert build.status_code == 200
+        index_key = build.json()["result"]["index_key"]
+
+        activate = client.post(
+            f"/admin/api/index/{index_key}/activate",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert activate.status_code == 200
+        assert activate.json()["status"] == "active"
+
+        health = client.get("/api/health")
+        assert health.status_code == 200
+        assert health.json()["loaded_index_key"] == index_key
+        assert health.json()["problem_count"] == 1

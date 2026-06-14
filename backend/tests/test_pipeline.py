@@ -14,7 +14,7 @@ from pipeline import (
     execute_build_index_job,
     index_cache_path,
 )
-from search import RewriteResult
+from search import IndexState, RewriteResult, load_index_cache
 
 
 def _temp_settings(tmp_path: Path):
@@ -159,6 +159,12 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
     assert finished["status"] == "succeeded"
     assert (cache_path / "manifest.json").exists()
     assert np.load(cache_path / "clean.npy", mmap_mode="r").shape == (1, 2)
+    loaded = load_index_cache(cache_path, "mmap")
+    state = IndexState()
+    state.activate(loaded, 1)
+    with state.search_snapshot() as snapshot:
+        assert snapshot.key == index_key
+        assert snapshot.problem_count == 1
 
     with db_connection(settings) as conn:
         index = conn.execute("SELECT * FROM indexes WHERE key = ?", (index_key,)).fetchone()
