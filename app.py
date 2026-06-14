@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import os
+import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +18,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from pydantic import BaseModel, Field
 
 from core import SRC_DIR, Settings, ensure_database, get_settings, verify_password
+from pipeline import confirm_import_job, create_import_dry_run, get_job, list_import_jobs
 from search import SearchIndex, search_events
 
 
@@ -139,6 +142,38 @@ def _clear_session_cookies(response: Response) -> None:
     response.delete_cookie("admin_csrf")
 
 
+def _decode_job(job: dict[str, Any]) -> dict[str, Any]:
+    decoded = dict(job)
+    for key in ("payload", "progress", "result"):
+        value = decoded.get(key)
+        if isinstance(value, str) and value:
+            try:
+                decoded[key] = json.loads(value)
+            except ValueError:
+                decoded[key] = value
+    return decoded
+
+
+async def _store_upload(file: UploadFile, current_settings: Settings) -> Path:
+    current_settings.storage.upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "upload.jsonl").suffix or ".jsonl"
+    path = current_settings.storage.upload_dir / f"{uuid.uuid4().hex}{suffix}"
+    total = 0
+    try:
+        with path.open("wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > current_settings.limits.upload_max_bytes:
+                    raise HTTPException(status_code=413, detail="Upload is too large")
+                f.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="Upload is empty")
+        return path
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -216,6 +251,48 @@ def create_app() -> FastAPI:
             "current_job": None,
             "today_searches": 0,
         }
+
+    @app.post("/admin/api/import/dry-run")
+    async def import_dry_run(
+        file: UploadFile = File(...),
+        mode: str = Form("upsert"),
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        current_settings = settings()
+        path = await _store_upload(file, current_settings)
+        try:
+            return create_import_dry_run(path, mode, current_settings)
+        except ValueError as exc:
+            path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/admin/api/import/{job_key}/confirm")
+    def import_confirm(
+        job_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return _decode_job(confirm_import_job(job_key, settings()))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/imports")
+    def imports(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+        del session
+        return {"items": [_decode_job(job) for job in list_import_jobs(settings())]}
+
+    @app.get("/admin/api/imports/{job_key}")
+    def import_detail(
+        job_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        job = get_job(settings(), job_key)
+        if job is None or job["type"] != "import":
+            raise HTTPException(status_code=404, detail="Import job not found")
+        return _decode_job(job)
 
     @app.get("/admin/api/settings")
     def admin_settings(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
