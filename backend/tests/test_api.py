@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 import app as app_module
 from app import create_app
 from core import db_connection, ensure_database, get_settings, hash_password, text_key, utc_now
-from search import Candidate, IndexState, RewriteResult
+from search import IndexState, RewriteResult
 
 
 def test_health_and_config() -> None:
@@ -29,39 +29,51 @@ def test_health_and_config() -> None:
 def test_search_stream_with_mocks(monkeypatch) -> None:
     import search as search_module
 
-    class FakeIndex:
-        def embed_query_vector(self, *args, **kwargs) -> list[float]:
-            return [1.0, 0.0]
-
-        def search_with_vector(self, *args, **kwargs) -> list[Candidate]:
-            return [
-                Candidate(
-                    problem_id="d_1",
-                    title="Sample",
-                    url="https://example.com",
-                    original_text="original",
-                    statement="statement",
-                    abstract="abstract",
-                    embedding_score=0.9,
-                )
-            ]
-
-        def rerank(self, *args, **kwargs) -> list[Candidate]:
-            candidate = self.search_with_vector()[0]
-            return [Candidate(**{**candidate.__dict__, "rerank_score": 0.8})]
-
-    def fake_index() -> FakeIndex:
-        return FakeIndex()
+    state = IndexState()
+    state.current = search_module.LoadedIndex(
+        key="i:test",
+        problem_keys=["d_1"],
+        titles=["Sample"],
+        urls=["https://example.com"],
+        texts={
+            "clean": ["original"],
+            "statement": ["statement"],
+            "abstract": ["abstract"],
+            "abstract_zh": ["abstract zh"],
+        },
+        matrices={
+            "clean": np.array([[1.0, 0.0]], dtype=np.float32),
+            "statement": np.array([[1.0, 0.0]], dtype=np.float32),
+            "abstract": np.array([[0.8, 0.2]], dtype=np.float32),
+            "abstract_zh": np.array([[0.7, 0.3]], dtype=np.float32),
+        },
+        load_mode="ram",
+    )
 
     def fake_rewrite(*args, **kwargs):
         from search import RewriteResult
 
-        return RewriteResult("rewritten statement", "rewritten abstract", "raw")
+        return RewriteResult(
+            statement="rewritten statement",
+            abstract="rewritten abstract",
+            abstract_zh="rewritten abstract zh",
+            clean="rewritten clean",
+            raw="raw",
+        )
+
+    def fake_embed(*args, **kwargs) -> np.ndarray:
+        texts = args[1]
+        return np.array([[1.0, 0.0]] * len(texts), dtype=np.float32)
+
+    def fake_rerank(*args, **kwargs) -> list[float]:
+        return [0.8]
 
     app = create_app()
     app.dependency_overrides = {}
-    monkeypatch.setattr(app_module, "legacy_index", fake_index)
+    monkeypatch.setattr(app_module, "index_state", lambda: state)
     monkeypatch.setattr(search_module, "rewrite_query", fake_rewrite)
+    monkeypatch.setattr(search_module, "embed_texts", fake_embed)
+    monkeypatch.setattr(search_module, "rerank_documents", fake_rerank)
     client = TestClient(app)
 
     response = client.post(
@@ -74,6 +86,18 @@ def test_search_stream_with_mocks(monkeypatch) -> None:
     assert [event["type"] for event in events][-2:] == ["candidates", "done"]
     assert any(event["type"] == "rewrite" for event in events)
     assert events[-2]["candidates"][0]["title"] == "Sample"
+
+
+def test_search_requires_active_index(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "index_state", lambda: IndexState())
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/search",
+        json={"query_text": "hello", "use_rewrite": False, "use_rerank": False},
+    )
+
+    assert response.status_code == 503
 
 
 def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:

@@ -554,6 +554,187 @@ def fuse_scores(
     )
 
 
+def query_views_from_rewrite(rewrite: RewriteResult) -> dict[str, str]:
+    return {
+        "clean": rewrite.clean or rewrite.statement,
+        "statement": rewrite.statement,
+        "abstract": rewrite.abstract,
+        "abstract_zh": rewrite.abstract_zh or rewrite.abstract,
+    }
+
+
+def retrieve_loaded_index(
+    loaded_index: LoadedIndex,
+    query_vectors: np.ndarray,
+    top_per_doc_view: int,
+) -> list[Candidate]:
+    if query_vectors.shape[0] != len(VIEWS):
+        raise ValueError("query vector view count mismatch")
+
+    candidates_by_ord: dict[int, float] = {}
+    query_matrix = query_vectors.T
+    for view in VIEWS:
+        matrix = loaded_index.matrices[view]
+        scores = matrix @ query_matrix
+        best_scores = np.max(scores, axis=1)
+        for index in top_indices(best_scores, min(top_per_doc_view, best_scores.shape[0])):
+            problem_ord = int(index)
+            score = float(best_scores[problem_ord])
+            current = candidates_by_ord.get(problem_ord)
+            if current is None or score > current:
+                candidates_by_ord[problem_ord] = score
+
+    ranked = sorted(candidates_by_ord.items(), key=lambda item: item[1], reverse=True)
+    candidates: list[Candidate] = []
+    for problem_ord, score in ranked:
+        candidates.append(
+            Candidate(
+                problem_id=loaded_index.problem_keys[problem_ord],
+                title=loaded_index.titles[problem_ord],
+                url=loaded_index.urls[problem_ord],
+                original_text=loaded_index.texts["clean"][problem_ord],
+                statement=loaded_index.texts["statement"][problem_ord],
+                abstract=loaded_index.texts["abstract"][problem_ord],
+                embedding_score=score,
+            )
+        )
+    return candidates
+
+
+def search_events_loaded(
+    request: Any,
+    settings: Settings,
+    loaded_index: LoadedIndex,
+) -> Iterator[str]:
+    timings: dict[str, float | str] = {}
+    search_config = settings.search
+
+    try:
+        edited_statement = (request.edited_statement or "").strip()
+        edited_abstract = (request.edited_abstract or "").strip()
+
+        if edited_statement:
+            timings["rewrite"] = "edited"
+            rewrite = RewriteResult(
+                clean=edited_statement,
+                statement=edited_statement,
+                abstract=edited_abstract or edited_statement,
+                abstract_zh=edited_abstract or edited_statement,
+                raw="",
+            )
+            yield _stage("rewrite", "done", detail="edited")
+            yield ndjson_event(
+                "rewrite",
+                statement=rewrite.statement,
+                abstract=rewrite.abstract,
+                raw="",
+                edited=True,
+            )
+        elif request.use_rewrite:
+            yield _stage("rewrite", "active")
+            start = perf_counter()
+            rewrite = rewrite_query(
+                settings.rewrite_model,
+                request.query_text,
+                timeout=settings.request_timeout,
+            )
+            elapsed = perf_counter() - start
+            timings["rewrite"] = elapsed
+            yield _stage("rewrite", "done", elapsed=elapsed)
+            yield ndjson_event(
+                "rewrite",
+                statement=rewrite.statement,
+                abstract=rewrite.abstract,
+                raw=rewrite.raw,
+                edited=False,
+            )
+        else:
+            query_text = request.query_text.strip()
+            if not query_text:
+                raise ValueError("query text is empty")
+            timings["rewrite"] = "off"
+            rewrite = RewriteResult(
+                clean=query_text,
+                statement=query_text,
+                abstract=query_text,
+                abstract_zh=query_text,
+                raw="",
+            )
+            yield _stage("rewrite", "skip", detail="off")
+
+        views = query_views_from_rewrite(rewrite)
+        if not views["statement"]:
+            raise ValueError("query text is empty")
+
+        yield _stage("embed", "active", detail="4 input")
+        embed_start = perf_counter()
+        query_vectors = embed_texts(
+            settings.embedding_model,
+            [views[view] for view in VIEWS],
+            timeout=settings.request_timeout,
+        )
+        query_vectors = normalize_matrix(np.asarray(query_vectors, dtype=np.float32))
+        embed_elapsed = perf_counter() - embed_start
+        timings["embed"] = embed_elapsed
+        yield _stage("embed", "done", elapsed=embed_elapsed, detail="4 input")
+
+        yield _stage("search", "active", detail=f"top{search_config.top_per_doc_view}")
+        search_start = perf_counter()
+        candidates = retrieve_loaded_index(
+            loaded_index,
+            query_vectors,
+            search_config.top_per_doc_view,
+        )[: search_config.top_retrieval]
+        search_elapsed = perf_counter() - search_start
+        timings["search"] = search_elapsed
+        yield _stage(
+            "search",
+            "done",
+            elapsed=search_elapsed,
+            detail=f"{len(candidates)} candidates",
+        )
+
+        if request.use_rerank:
+            rerank_candidates = candidates[: search_config.rerank_top_k]
+            yield _stage("rerank", "active", detail=f"{len(rerank_candidates)} candidates")
+            rerank_start = perf_counter()
+            scores = rerank_documents(
+                settings.rerank_model,
+                views["abstract_zh"],
+                [
+                    f"{candidate.original_text}\n\n{candidate.statement}"
+                    for candidate in rerank_candidates
+                ],
+                timeout=settings.request_timeout,
+            )
+            reranked = {
+                candidate.problem_id: replace(candidate, rerank_score=score)
+                for candidate, score in zip(rerank_candidates, scores, strict=True)
+            }
+            candidates = [reranked.get(candidate.problem_id, candidate) for candidate in candidates]
+            rerank_elapsed = perf_counter() - rerank_start
+            timings["rerank"] = rerank_elapsed
+            yield _stage("rerank", "done", elapsed=rerank_elapsed)
+        else:
+            timings["rerank"] = "off"
+            yield _stage("rerank", "skip", detail="off")
+
+        fused = fuse_scores(
+            candidates,
+            request.beta,
+            search_config.rerank_range_floor,
+            search_config.embedding_range_floor,
+        )
+        yield ndjson_event(
+            "candidates",
+            candidates=[asdict(candidate) for candidate in fused],
+            timings=timings,
+        )
+        yield ndjson_event("done")
+    except Exception as exc:
+        yield ndjson_event("error", message=str(exc))
+
+
 def ndjson_event(event_type: str, **payload: Any) -> str:
     return json.dumps({"type": event_type, **payload}, ensure_ascii=False) + "\n"
 

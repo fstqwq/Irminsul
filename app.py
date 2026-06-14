@@ -29,7 +29,7 @@ from pipeline import (
     list_import_jobs,
     list_indexes,
 )
-from search import IndexState, SearchIndex, load_index_cache, search_events
+from search import IndexState, SearchIndex, load_index_cache, search_events_loaded
 
 
 class SearchRequest(BaseModel):
@@ -294,8 +294,18 @@ def create_app() -> FastAPI:
 
     @app.post("/api/search")
     def search(request: SearchRequest) -> StreamingResponse:
+        state = index_state()
+        if state.switching:
+            raise HTTPException(status_code=503, detail="Index is switching")
+        if state.current is None:
+            raise HTTPException(status_code=503, detail="Index is not loaded")
+
+        def stream() -> Any:
+            with state.search_snapshot() as loaded:
+                yield from search_events_loaded(request, settings(), loaded)
+
         return StreamingResponse(
-            search_events(request, settings(), legacy_index()),
+            stream(),
             media_type="application/x-ndjson",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
