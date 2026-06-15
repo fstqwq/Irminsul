@@ -56,8 +56,26 @@ class JobWorker:
 
 def recover_startup(settings: Settings) -> None:
     with db_connection(settings) as conn:
+        running_jobs = conn.execute("SELECT * FROM jobs WHERE status = 'running'").fetchall()
         with conn:
-            conn.execute("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'", (utc_now(),))
+            for row in running_jobs:
+                job = row_to_dict(row)
+                if _job_progress(job).get("cancel_requested"):
+                    result = _job_result(job)
+                    result["canceled"] = True
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'failed', result = ?, error = ?, updated_at = ?
+                        WHERE key = ?
+                        """,
+                        (json_dumps(result), "Canceled by admin", utc_now(), job["key"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE jobs SET status = 'queued', updated_at = ? WHERE key = ?",
+                        (utc_now(), job["key"]),
+                    )
             conn.execute(
                 "UPDATE artifacts SET status = 'pending', updated_at = ? WHERE status = 'running'",
                 (utc_now(),),
@@ -369,6 +387,8 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
         job = row_to_dict(row)
         if job["status"] != "queued":
             raise ValueError("import job is not queued")
+        if _job_progress(job).get("cancel_requested"):
+            return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
         path = Path(payload["path"])
         mode = _validate_import_mode(str(payload["mode"]))
@@ -394,6 +414,8 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
 
     with db_connection(settings) as conn:
         for index, row in enumerate(rows, start=1):
+            if canceled := _finish_if_cancel_requested(settings, job_key, {"processed": index - 1, "total": len(rows)}):
+                return canceled
             row_keys_by_source.setdefault(row.source_key, set()).add(row.problem_key)
             now = utc_now()
             problem_text_key = text_key(row.text)
@@ -795,12 +817,14 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         job = row_to_dict(row)
         if job["status"] != "queued":
             raise ValueError("build job is not queued")
+        if _job_progress(job).get("cancel_requested"):
+            return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
         with conn:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'running', progress = ?, updated_at = ?
+                SET status = 'running', progress = ?, result = NULL, error = NULL, updated_at = ?
                 WHERE key = ?
                 """,
                 (json_dumps({"phase": "artifacts"}), utc_now(), job_key),
@@ -813,6 +837,12 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
 
     for position, problem in enumerate(snapshot, start=1):
+        if canceled := _finish_if_cancel_requested(
+            settings,
+            job_key,
+            {"failures": failures, "processed": position - 1, "total": len(snapshot)},
+        ):
+            return canceled
         try:
             rewrite = ensure_rewrite_artifact(
                 settings,
@@ -848,6 +878,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                 "total": len(snapshot),
                 "failures": len(failures),
             },
+            {"failures": failures} if failures else None,
         )
 
     if failures:
@@ -1436,12 +1467,57 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'queued', error = NULL, updated_at = ?
+                SET status = 'queued', progress = ?, result = NULL, error = NULL, updated_at = ?
                 WHERE key = ?
                 """,
-                (utc_now(), job_key),
+                (json_dumps({"phase": "queued"}), utc_now(), job_key),
             )
     return get_job(settings, job_key) or job
+
+
+def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("job not found")
+    if job["status"] in {"succeeded", "blocked", "failed"}:
+        raise ValueError("job is not running or queued")
+
+    progress = _job_progress(job)
+    progress["cancel_requested"] = True
+    progress.setdefault("phase", "canceling")
+    result = _job_result(job)
+    result["canceled"] = True
+    now = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            if job["status"] in {"draft", "queued"}:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed', progress = ?, result = ?, error = ?, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        json_dumps(progress),
+                        json_dumps(result),
+                        "Canceled by admin",
+                        now,
+                        job_key,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET progress = ?, result = ?, updated_at = ?
+                    WHERE key = ? AND status = 'running'
+                    """,
+                    (json_dumps(progress), json_dumps(result), now, job_key),
+                )
+    updated = get_job(settings, job_key)
+    if updated is None:
+        raise ValueError("job not found after cancel")
+    return updated
 
 
 def create_cleanup_job(settings: Settings) -> dict[str, Any]:
@@ -1583,6 +1659,9 @@ def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
             raise ValueError("cleanup job not found")
         if row["status"] != "queued":
             raise ValueError("cleanup job is not queued")
+        job = row_to_dict(row)
+        if _job_progress(job).get("cancel_requested"):
+            return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
         with conn:
             conn.execute(
                 "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ?",
@@ -1597,8 +1676,18 @@ def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
             )
             removed_audits = cursor.rowcount
 
+    if canceled := _finish_if_cancel_requested(settings, job_key, {"removed_audits": removed_audits}):
+        return canceled
+
     _update_job_progress(settings, job_key, {"phase": "uploads"})
     removed_uploads = _cleanup_expired_uploads(settings)
+
+    if canceled := _finish_if_cancel_requested(
+        settings,
+        job_key,
+        {"removed_audits": removed_audits, "removed_uploads": removed_uploads},
+    ):
+        return canceled
 
     _update_job_progress(settings, job_key, {"phase": "cache"})
     building_dir = settings.storage.index_cache_dir / ".building"
@@ -1633,13 +1722,75 @@ def _mark_job_failed(settings: Settings, job_key: str, error: str) -> None:
             )
 
 
-def _update_job_progress(settings: Settings, job_key: str, progress: dict[str, Any]) -> None:
+def _job_progress(job: dict[str, Any]) -> dict[str, Any]:
+    raw = job.get("progress")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            return {}
+    return {}
+
+
+def _job_result(job: dict[str, Any]) -> dict[str, Any]:
+    raw = job.get("result")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            return {}
+    return {}
+
+
+def _cancel_requested(settings: Settings, job_key: str) -> bool:
+    job = get_job(settings, job_key)
+    return bool(job and _job_progress(job).get("cancel_requested"))
+
+
+def _finish_if_cancel_requested(
+    settings: Settings,
+    job_key: str,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not _cancel_requested(settings, job_key):
+        return None
+    payload = dict(result or {})
+    payload["canceled"] = True
+    return _finish_job(settings, job_key, "failed", payload, "Canceled by admin")
+
+
+def _update_job_progress(
+    settings: Settings,
+    job_key: str,
+    progress: dict[str, Any],
+    result: dict[str, Any] | None = None,
+) -> None:
     with db_connection(settings) as conn:
         with conn:
-            conn.execute(
-                "UPDATE jobs SET progress = ?, updated_at = ? WHERE key = ?",
-                (json_dumps(progress), utc_now(), job_key),
-            )
+            row = conn.execute("SELECT progress FROM jobs WHERE key = ?", (job_key,)).fetchone()
+            if row is not None:
+                current_progress = _job_progress(row_to_dict(row))
+                if current_progress.get("cancel_requested") and not progress.get("cancel_requested"):
+                    progress = dict(progress)
+                    progress["cancel_requested"] = True
+            if result is None:
+                conn.execute(
+                    "UPDATE jobs SET progress = ?, updated_at = ? WHERE key = ?",
+                    (json_dumps(progress), utc_now(), job_key),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET progress = ?, result = ?, updated_at = ? WHERE key = ?",
+                    (json_dumps(progress), json_dumps(result), utc_now(), job_key),
+                )
 
 
 def _finish_job(

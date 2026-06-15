@@ -156,6 +156,7 @@ const state: AdminState = {
 };
 
 let rootEl: HTMLElement;
+let refreshTimer: number | null = null;
 
 export function startAdmin(root: HTMLElement): void {
   rootEl = root;
@@ -219,14 +220,14 @@ async function checkSession(): Promise<void> {
   }
 }
 
-async function loadPage(): Promise<void> {
+async function loadPage(options: { silent?: boolean } = {}): Promise<void> {
   if (!state.authenticated) {
     render();
     return;
   }
-  state.loading = true;
+  if (!options.silent) state.loading = true;
   state.error = "";
-  render();
+  if (!options.silent) render();
   try {
     if (state.page === "dashboard") state.data.dashboard = await api("/admin/api/dashboard");
     if (state.page === "imports") state.data.imports = await api("/admin/api/imports");
@@ -237,6 +238,10 @@ async function loadPage(): Promise<void> {
     if (state.page === "indexes") state.data.indexes = await api("/admin/api/indexes");
     if (state.page === "jobs") {
       state.data.jobs = await api(`/admin/api/jobs?${query(state.filters.jobs)}`);
+      const detailKey = String(asRecord(state.details.job).key || "");
+      if (detailKey) {
+        state.details.job = await api<Row>(`/admin/api/jobs/${encodeURIComponent(detailKey)}`);
+      }
     }
     if (state.page === "audits") {
       state.data.audits = await api(`/admin/api/audits?${query(state.filters.audits)}`);
@@ -245,7 +250,7 @@ async function loadPage(): Promise<void> {
   } catch (error) {
     state.error = (error as Error).message;
   } finally {
-    state.loading = false;
+    if (!options.silent) state.loading = false;
     render();
   }
 }
@@ -258,8 +263,42 @@ function query(values: Record<string, string | number>): string {
   return params.toString();
 }
 
+function stopAutoRefresh(): void {
+  if (refreshTimer !== null) {
+    window.clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+function scheduleAutoRefresh(): void {
+  stopAutoRefresh();
+  if (state.loading || !state.authenticated || !pageHasActiveJob()) return;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = null;
+    void loadPage({ silent: true });
+  }, 2500);
+}
+
+function pageHasActiveJob(): boolean {
+  if (state.page === "dashboard") {
+    const currentJob = asRecord(asRecord(state.data.dashboard).current_job);
+    return isActiveJobStatus(currentJob.status);
+  }
+  if (state.page === "jobs") {
+    const jobs = asRows(asRecord(state.data.jobs).items);
+    const detail = asRecord(state.details.job);
+    return jobs.some((job) => isActiveJobStatus(job.status)) || isActiveJobStatus(detail.status);
+  }
+  return false;
+}
+
+function isActiveJobStatus(raw: unknown): boolean {
+  return ["queued", "running"].includes(String(raw || ""));
+}
+
 function render(): void {
   if (!state.authenticated) {
+    stopAutoRefresh();
     rootEl.innerHTML = renderLogin();
     bindLogin();
     return;
@@ -284,6 +323,7 @@ function render(): void {
       </main>
     </div>`;
   bindAdmin();
+  scheduleAutoRefresh();
 }
 
 function renderLogin(): string {
@@ -604,6 +644,7 @@ function jobRow(item: Row): string {
       <td>${shortDate(item.updated_at)}</td>
       <td class="admin-actions">
         <button data-job-detail="${escapeHtml(key)}" type="button">View</button>
+        ${isActiveJobStatus(status) ? `<button data-cancel-job="${escapeHtml(key)}" type="button">Cancel</button>` : ""}
         ${["blocked", "failed"].includes(status) ? `<button data-retry-job="${escapeHtml(key)}" type="button">Retry</button>` : ""}
       </td>
     </tr>`;
@@ -624,6 +665,9 @@ function renderJobDetail(job: Row): string {
       jsonBlock("Payload", job.payload) +
       jsonBlock("Result", job.result) +
       jsonBlock("Error", job.error) +
+      (isActiveJobStatus(status)
+        ? `<button data-cancel-job="${escapeHtml(String(job.key || ""))}" type="button">Cancel</button>`
+        : "") +
       (["blocked", "failed"].includes(status)
         ? `<button data-retry-job="${escapeHtml(String(job.key || ""))}" type="button">Retry</button>`
         : ""),
@@ -881,11 +925,12 @@ function formatProgress(type: unknown, progress: unknown): string {
   const parsed = parseMaybeJson(progress);
   const data = asRecord(parsed);
   if (!Object.keys(data).length) return "";
+  const prefix = data.cancel_requested ? "Cancel requested, " : "";
 
   const stats = asRecord(data.stats);
   if (Object.keys(stats).length) {
     const errors = Array.isArray(stats.errors) ? stats.errors.length : Number(stats.errors || 0);
-    return `New: ${Number(stats.new || 0)}, Updated: ${Number(stats.overwrite || 0)}, Skipped: ${Number(
+    return `${prefix}New: ${Number(stats.new || 0)}, Updated: ${Number(stats.overwrite || 0)}, Skipped: ${Number(
       stats.skip || 0
     )}, Errors: ${errors}`;
   }
@@ -896,7 +941,7 @@ function formatProgress(type: unknown, progress: unknown): string {
   if (total > 0) {
     const unit = kind === "import" ? "rows" : "problems";
     const failures = Number(data.failures || 0);
-    return `${processed} / ${total} ${unit}${failures ? `, ${failures} failed` : ""}`;
+    return `${prefix}${processed} / ${total} ${unit}${failures ? `, ${failures} failed` : ""}`;
   }
 
   const succeededRewrites = Number(data.succeeded_rewrites || 0);
@@ -905,11 +950,11 @@ function formatProgress(type: unknown, progress: unknown): string {
   const totalEmbeddings = Number(data.total_embeddings || 0);
   const artifactTotal = totalRewrites + totalEmbeddings;
   if (artifactTotal > 0) {
-    return `${succeededRewrites + succeededEmbeddings} / ${artifactTotal} artifacts`;
+    return `${prefix}${succeededRewrites + succeededEmbeddings} / ${artifactTotal} artifacts`;
   }
 
   const phase = String(data.phase || "");
-  if (phase) return titleCase(phase.replace(/_/g, " "));
+  if (phase) return `${prefix}${titleCase(phase.replace(/_/g, " "))}`;
   return compactJson(progress);
 }
 
@@ -1242,6 +1287,20 @@ function bindJobs(): void {
       void api(`/admin/api/jobs/${encodeURIComponent(key)}/retry`, { method: "POST" })
         .then(() => {
           state.notice = "Job queued for retry.";
+          return loadPage();
+        })
+        .catch(showError);
+    });
+  });
+
+  rootEl.querySelectorAll<HTMLButtonElement>("[data-cancel-job]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.cancelJob || "";
+      if (!window.confirm("Cancel this job? Running API calls will stop at the next checkpoint.")) return;
+      void api(`/admin/api/jobs/${encodeURIComponent(key)}/cancel`, { method: "POST" })
+        .then((detail) => {
+          state.details.job = asRecord(detail);
+          state.notice = "Job cancellation requested.";
           return loadPage();
         })
         .catch(showError);

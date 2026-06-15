@@ -29,6 +29,7 @@ from core import (
 )
 from pipeline import (
     batch_update_problems,
+    cancel_job,
     confirm_import_job,
     create_cleanup_job,
     create_build_index_job,
@@ -556,6 +557,17 @@ def create_app() -> FastAPI:
         del session
         try:
             return _decode_job(retry_job(settings(), job_key))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/admin/api/jobs/{job_key}/cancel")
+    def job_cancel(
+        job_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return _decode_job(cancel_job(settings(), job_key))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

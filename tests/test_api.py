@@ -181,6 +181,8 @@ def test_search_requires_active_index(monkeypatch) -> None:
 
 
 def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
+    import pipeline as pipeline_module
+
     base_settings = get_settings()
     storage = replace(
         base_settings.storage,
@@ -272,6 +274,53 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         jobs = client.get("/admin/api/jobs?type=import")
         assert jobs.status_code == 200
         assert jobs.json()["items"][0]["key"] == payload["job_key"]
+
+        with db_connection(test_settings) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                    VALUES ('j:cancel-test', 'import', 'draft', '{}', '{"phase":"draft"}', ?, ?)
+                    """,
+                    (utc_now(), utc_now()),
+                )
+        canceled = client.post(
+            "/admin/api/jobs/j:cancel-test/cancel",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert canceled.status_code == 200
+        assert canceled.json()["status"] == "failed"
+        assert canceled.json()["result"]["canceled"] is True
+
+        with db_connection(test_settings) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO jobs(key, type, status, payload, progress, result, created_at, updated_at)
+                    VALUES ('j:cancel-running', 'build_index', 'running', '{}', '{"phase":"artifacts"}',
+                            '{"failures":[{"problem_key":"QOJ/10202","error":"DEEPSEEK_API_KEY is not configured"}]}',
+                            ?, ?)
+                    """,
+                    (utc_now(), utc_now()),
+                )
+        running_cancel = client.post(
+            "/admin/api/jobs/j:cancel-running/cancel",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert running_cancel.status_code == 200
+        assert running_cancel.json()["status"] == "running"
+        assert running_cancel.json()["progress"]["cancel_requested"] is True
+        assert running_cancel.json()["result"]["canceled"] is True
+        assert running_cancel.json()["result"]["failures"][0]["problem_key"] == "QOJ/10202"
+
+        pipeline_module._update_job_progress(
+            test_settings,
+            "j:cancel-running",
+            {"phase": "artifacts", "processed": 42, "total": 1223},
+        )
+        refreshed = client.get("/admin/api/jobs/j:cancel-running")
+        assert refreshed.status_code == 200
+        assert refreshed.json()["progress"]["cancel_requested"] is True
 
     with db_connection(test_settings) as conn:
         source = conn.execute("SELECT * FROM sources WHERE key = 'CodeForces'").fetchone()
