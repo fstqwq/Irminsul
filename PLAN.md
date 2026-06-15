@@ -101,7 +101,7 @@ CREATE INDEX idx_artifacts_lookup ON artifacts(kind, parent_key, method_key, rol
 | rewrite | `r:` | text_key | `rewrite` | null | `{clean,statement,abstract,abstract_zh,usage,method_snapshot}` | null |
 | embedding | `e:` | rewrite_key | view 名 | null | `{dim,dtype,normalized,usage,method_snapshot}` | float32 向量 |
 
-`method_snapshot` 保存生成时的完整 method 配置（model/prompt/dim/normalize 等），用于事后追溯。
+`method_snapshot` 保存生成时的完整 method 配置（runtime model/provider endpoint/api_key_env + identity/prompt/dim/normalize 等），用于事后追溯。
 
 核心语义：**派生产物由 `(kind, parent_key, method_key, role)` 唯一确定**。
 
@@ -168,7 +168,7 @@ CREATE TABLE kv (
 | Key | 公式 |
 |-----|------|
 | text_key | `t:` + sha256(canonical_text) |
-| method_key | `m:` + sha256(kind + model + prompt/config) |
+| method_key | `m:` + sha256(kind + model identity + prompt/config)，不包含 provider endpoint / api_key_env |
 | rewrite_key | `r:` + sha256(`rewrite` + text_key + rewrite_method_key + `rewrite`) |
 | embedding_key | `e:` + sha256(`embedding` + rewrite_key + embedding_method_key + view) |
 | row_hash | sha256(schema_version + problem_ord + problem_key + view + embedding_key + title + url + text_key + rewrite_key) |
@@ -202,7 +202,7 @@ CREATE TABLE kv (
 
 状态机：`pending → running → succeeded | failed`。服务重启时 `running → pending`。
 
-**rewrite**（`ensure_rewrite`）：计算 rewrite_key → INSERT OR IGNORE pending → 已 succeeded 直接复用 → 否则调 DeepSeek → 解析四段 → 短事务写回。
+**rewrite**（`ensure_rewrite`）：计算 rewrite_key → INSERT OR IGNORE pending → 已 succeeded 直接复用 → 否则通过 OpenRouter 调 rewrite 模型 → 解析四段 → 短事务写回。
 
 **rewrite 并发 + embedding 批量**：先按 `rewrite_concurrency=16` 并发生成 pending rewrite artifacts；全部 rewrite 完成后，收集 pending embedding artifacts → 按 `embedding_batch_size=128` 分批 → 标记 running → 事务外调 `embed_texts()` → L2 normalize → 逐条短事务写回 succeeded。
 
@@ -288,7 +288,7 @@ class IndexState:
 
 ```text
 POST /api/search → 检查 switching/索引可用
-  → DeepSeek rewrite query 为 4 view
+  → OpenRouter rewrite query 为 4 view
   → Qwen embedding 4 个 query vector（L2 normalized）
   → all_query_best_doc_top50_union 召回
   → rerank_top_k=0 时保留全部 top_retrieval；rerank_top_k>0 时按 embedding_score 截断到 topK
@@ -465,14 +465,15 @@ activation_drain_timeout_seconds = 30
 [audit]
 retention_days = 90
 
-[audit.pricing.deepseek.deepseek-v4-flash]
-input_price_per_1m_tokens_microusd = 100000
-output_price_per_1m_tokens_microusd = 300000
+[audit.pricing.openrouter."deepseek/deepseek-v4-flash"]
+input_price_per_1m_tokens_microusd = 90000
+output_price_per_1m_tokens_microusd = 180000
 
 [models.rewrite]
-model = "deepseek-v4-flash"
-url = "https://api.deepseek.com/chat/completions"
-api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek/deepseek-v4-flash"
+identity = "deepseek-v4-flash"
+url = "https://openrouter.ai/api/v1/chat/completions"
+api_key_env = "OPENROUTER_API_KEY"
 
 [models.embedding]
 model = "Qwen/Qwen3-Embedding-8B"

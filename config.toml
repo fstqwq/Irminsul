@@ -39,9 +39,9 @@ activation_drain_timeout_seconds = 30
 [audit]
 retention_days = 90
 
-[audit.pricing.deepseek.deepseek-v4-flash]
-input_price_per_1m_tokens_microusd = 100000
-output_price_per_1m_tokens_microusd = 300000
+[audit.pricing.openrouter."deepseek/deepseek-v4-flash"]
+input_price_per_1m_tokens_microusd = 90000
+output_price_per_1m_tokens_microusd = 180000
 
 [audit.pricing.openrouter."Qwen/Qwen3-Embedding-8B"]
 input_price_per_1m_tokens_microusd = 10000
@@ -50,9 +50,10 @@ input_price_per_1m_tokens_microusd = 10000
 input_price_per_1m_tokens_microusd = 50000
 
 [models.rewrite]
-model = "deepseek-v4-flash"
-url = "https://api.deepseek.com/chat/completions"
-api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek/deepseek-v4-flash"
+identity = "deepseek-v4-flash"
+url = "https://openrouter.ai/api/v1/chat/completions"
+api_key_env = "OPENROUTER_API_KEY"
 
 [models.embedding]
 model = "Qwen/Qwen3-Embedding-8B"

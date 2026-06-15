@@ -27,6 +27,11 @@ class ModelConfig:
     model: str
     url: str
     api_key_env: str
+    identity: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.identity:
+            object.__setattr__(self, "identity", self.model)
 
     @property
     def api_key(self) -> str:
@@ -145,6 +150,7 @@ def _model_config(name: str, data: dict[str, Any]) -> ModelConfig:
         model=str(data["model"]),
         url=str(data["url"]),
         api_key_env=str(data["api_key_env"]),
+        identity=str(data.get("identity") or data["model"]),
     )
 
 
@@ -243,9 +249,7 @@ def method_key(kind: str, config: dict[str, Any] | ModelConfig) -> str:
     if isinstance(config, ModelConfig):
         payload: dict[str, Any] = {
             "kind": kind,
-            "model": config.model,
-            "url": config.url,
-            "api_key_env": config.api_key_env,
+            "model": config.identity,
         }
     else:
         payload = {"kind": kind, **config}

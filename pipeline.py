@@ -174,9 +174,7 @@ def rewrite_method_key(settings: Settings) -> str:
     return method_key(
         "rewrite",
         {
-            "model": settings.rewrite_model.model,
-            "url": settings.rewrite_model.url,
-            "api_key_env": settings.rewrite_model.api_key_env,
+            "model": settings.rewrite_model.identity,
             "prompt": REWRITE_PROMPT,
             "views": list(VIEWS),
         },
@@ -187,9 +185,7 @@ def embedding_method_key(settings: Settings) -> str:
     return method_key(
         "embedding",
         {
-            "model": settings.embedding_model.model,
-            "url": settings.embedding_model.url,
-            "api_key_env": settings.embedding_model.api_key_env,
+            "model": settings.embedding_model.identity,
             "dtype": "float32",
             "normalized": True,
             "views": list(VIEWS),
@@ -201,6 +197,7 @@ def _model_snapshot(settings: Settings, kind: Literal["rewrite", "embedding"]) -
     model = settings.rewrite_model if kind == "rewrite" else settings.embedding_model
     snapshot: dict[str, Any] = {
         "model": model.model,
+        "identity": model.identity,
         "url": model.url,
         "api_key_env": model.api_key_env,
     }

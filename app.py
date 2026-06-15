@@ -734,16 +734,19 @@ def create_app() -> FastAPI:
             "models": {
                 "rewrite": {
                     "model": current_settings.rewrite_model.model,
+                    "identity": current_settings.rewrite_model.identity,
                     "url": current_settings.rewrite_model.url,
                     "api_key_env": current_settings.rewrite_model.api_key_env,
                 },
                 "embedding": {
                     "model": current_settings.embedding_model.model,
+                    "identity": current_settings.embedding_model.identity,
                     "url": current_settings.embedding_model.url,
                     "api_key_env": current_settings.embedding_model.api_key_env,
                 },
                 "rerank": {
                     "model": current_settings.rerank_model.model,
+                    "identity": current_settings.rerank_model.identity,
                     "url": current_settings.rerank_model.url,
                     "api_key_env": current_settings.rerank_model.api_key_env,
                 },

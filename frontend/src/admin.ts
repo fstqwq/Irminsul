@@ -111,6 +111,7 @@ const settingsKeyLabels: Record<string, string> = {
   activation_drain_timeout_seconds: "Activation drain timeout (s)",
   name: "Provider",
   model: "Model",
+  identity: "Model identity",
   url: "Endpoint",
   api_key_env: "API key environment variable"
 };

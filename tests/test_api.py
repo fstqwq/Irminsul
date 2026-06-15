@@ -143,7 +143,7 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         assert rewrite_event["abstract"] == "rewritten abstract"
         assert rewrite_event["abstract_zh"] == "rewritten abstract zh"
         candidate = events[-2]["candidates"][0]
-        assert events[-2]["cost"]["microusd"] == 70
+        assert events[-2]["cost"]["microusd"] == 45
         assert candidate["title"] == "Sample"
         assert candidate["clean"] == "original"
         assert candidate["statement"] == "statement"
@@ -176,9 +176,9 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
 
     assert audit["query"] == "hello"
     assert json.loads(audit["result"])["top"][0]["title"] == "Sample"
-    assert json.loads(audit["cost"])["microusd"] == 70
+    assert json.loads(audit["cost"])["microusd"] == 45
     rewrite_call = json.loads(audit["api_calls"])[0]
-    assert rewrite_call["pricing"]["input_price_per_1m_tokens_microusd"] == 100000
+    assert rewrite_call["pricing"]["input_price_per_1m_tokens_microusd"] == 90000
 
 
 def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch, tmp_path: Path) -> None:
@@ -389,7 +389,7 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
                     """
                     INSERT INTO jobs(key, type, status, payload, progress, result, created_at, updated_at)
                     VALUES ('j:cancel-running', 'build_index', 'running', '{}', '{"phase":"artifacts"}',
-                            '{"failures":[{"problem_key":"QOJ/10202","error":"DEEPSEEK_API_KEY is not configured"}]}',
+                            '{"failures":[{"problem_key":"QOJ/10202","error":"OPENROUTER_API_KEY is not configured"}]}',
                             ?, ?)
                     """,
                     (utc_now(), utc_now()),

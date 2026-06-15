@@ -14,12 +14,14 @@ import numpy as np
 from core import create_cleanup_job, db_connection, ensure_database, get_settings, text_key, utc_now
 from pipeline import (
     create_build_index_job,
+    embedding_method_key,
     ensure_embedding_artifacts,
     ensure_rewrite_artifact,
     execute_build_index_job,
     execute_cleanup_job,
     index_cache_path,
     rebuild_index_cache,
+    rewrite_method_key,
 )
 from search import IndexState, RewriteResult, load_index_cache
 
@@ -33,6 +35,50 @@ def _temp_settings(tmp_path: Path):
         index_cache_dir=tmp_path / "index_cache",
     )
     return replace(base_settings, storage=storage)
+
+
+def test_method_keys_use_model_identity_not_provider(tmp_path: Path) -> None:
+    settings = _temp_settings(tmp_path)
+    direct_rewrite = replace(
+        settings.rewrite_model,
+        model="deepseek-v4-flash",
+        identity="deepseek-v4-flash",
+        url="https://api.deepseek.com/chat/completions",
+        api_key_env="DEEPSEEK_API_KEY",
+    )
+    openrouter_rewrite = replace(
+        settings.rewrite_model,
+        model="deepseek/deepseek-v4-flash",
+        identity="deepseek-v4-flash",
+        url="https://openrouter.ai/api/v1/chat/completions",
+        api_key_env="OPENROUTER_API_KEY",
+    )
+    changed_model = replace(openrouter_rewrite, identity="deepseek-v4-flash-next")
+
+    assert rewrite_method_key(replace(settings, rewrite_model=direct_rewrite)) == rewrite_method_key(
+        replace(settings, rewrite_model=openrouter_rewrite)
+    )
+    assert rewrite_method_key(replace(settings, rewrite_model=openrouter_rewrite)) != rewrite_method_key(
+        replace(settings, rewrite_model=changed_model)
+    )
+
+    direct_embedding = replace(
+        settings.embedding_model,
+        model="Qwen/Qwen3-Embedding-8B",
+        identity="Qwen/Qwen3-Embedding-8B",
+        url="https://example.com/embeddings",
+        api_key_env="EMBED_KEY_A",
+    )
+    routed_embedding = replace(
+        settings.embedding_model,
+        model="Qwen/Qwen3-Embedding-8B",
+        identity="Qwen/Qwen3-Embedding-8B",
+        url="https://openrouter.ai/api/v1/embeddings",
+        api_key_env="OPENROUTER_API_KEY",
+    )
+    assert embedding_method_key(replace(settings, embedding_model=direct_embedding)) == embedding_method_key(
+        replace(settings, embedding_model=routed_embedding)
+    )
 
 
 def test_rewrite_and_embedding_artifacts_are_reused(monkeypatch, tmp_path: Path) -> None:

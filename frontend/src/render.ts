@@ -232,11 +232,6 @@ function renderError(state: AppState): string {
   return `<div class="error-panel" role="alert">${escapeHtml(state.error)}</div>`;
 }
 
-function renderEmpty(state: AppState): string {
-  if (state.hasSearched || state.isRunning) return "";
-  return `<div class="empty-note">Paste a statement and search.</div>`;
-}
-
 function renderResults(state: AppState): string {
   if (state.isRunning && !state.candidates.length) return renderSkeleton();
   if (!state.candidates.length) return "";
@@ -318,7 +313,7 @@ export function renderApp(root: HTMLElement, state: AppState, actions: Actions):
       <header class="topbar">
         <div class="topbar-inner">
           <div class="brand">
-            <span class="brand-mark" aria-hidden="true"></span>
+            <img class="brand-mark" src="/irminsul.png" alt="" aria-hidden="true">
             <span class="brand-name">Irminsul</span>
           </div>
           <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings">${icon("settings")}</button>
@@ -337,7 +332,6 @@ export function renderApp(root: HTMLElement, state: AppState, actions: Actions):
         ${renderError(state)}
         ${renderToolbar(state)}
         ${renderResults(state)}
-        ${renderEmpty(state)}
         ${renderFooter(state)}
       </main>
     </div>`;
