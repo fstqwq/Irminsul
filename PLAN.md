@@ -1,435 +1,300 @@
-# 数据资产管理后台与四视图索引发布系统
+# Irminsul 数据资产管理后台与四视图索引发布系统
 
-## 1. 目标与架构
+## 1. 当前目标
 
-把文件驱动的 FastAPI 搜索服务改造为 SQLite 管理 + `.npy` cache 加载 + 内存检索的闭环系统。
+Irminsul 是一个单机 FastAPI 服务，提供两类能力：
 
-```text
-JSONL 导入 → 管理题目/来源 → 四视图 rewrite → 四视图 embedding
-  → 构建不可变 index → 导出 .npy cache → 激活/回滚
-  → 搜索服务(内存矩阵) → 查询审计
-```
+1. 面向用户的题目相似检索前台。
+2. 面向管理员的数据资产、模型产物、索引与任务管理后台。
 
-**核心约束**：单机、单进程、单 worker、SQLite、不做 ORM/Celery/多 worker。
-
-### 1.1 数据分层
-
-| 层 | 职责 | 存储 |
-|----|------|------|
-| Canonical Store | 题目、artifact、index 版本定义 | SQLite |
-| 发布层 | 矩阵 + 元数据，加速加载 | `.npy` cache 目录 |
-| 运行时 | `LoadedIndex` 四矩阵 + 文本 | 进程内存 / mmap |
-
-搜索请求**不访问 SQLite 向量表**，只用内存索引。SQLite 仅在写 `search_audits` 时访问。
-
-### 1.2 后端文件
+系统从 JSONL 导入题目，生成四种文本视图，生成 embedding，构建不可变索引，导出 `.npy` cache，并把 active index 加载到内存或 mmap 后服务前台检索。
 
 ```text
-app.py       路由、认证、CSRF、中间件、生命周期
-core.py      SQLite、迁移、key 计算、配置
-pipeline.py  导入、artifact 生成、build job、cache 导出
-search.py    LoadedIndex、IndexState、检索、rerank、fusion、审计
+JSONL import
+  -> problems / sources / problem_text artifacts
+  -> rewrite artifacts: clean / statement / abstract / abstract_zh
+  -> embedding artifacts for each view
+  -> immutable index rows
+  -> .npy cache
+  -> active LoadedIndex
+  -> streaming search API
 ```
 
-### 1.3 依赖
+核心约束：
+
+- 单机、单进程、SQLite。
+- 不引入 SQLAlchemy、Alembic、Celery、Redis。
+- 不跨线程共享 SQLite connection。
+- 公开搜索路径不从 SQLite 读取向量，只读取 active `LoadedIndex`。
+- SQLite 是 canonical store；`.npy` cache 是发布层和启动加速层。
+
+## 2. 代码边界
 
 ```text
-fastapi  uvicorn  numpy  requests  pydantic
-python-multipart  itsdangerous  pytest  httpx
+app.py        FastAPI 路由、认证、CSRF、生命周期、静态文件托管
+core.py       配置、SQLite schema/migration、连接、key、CRUD
+pipeline.py   import、rewrite/embedding artifact 生成、index build/cache/job worker
+search.py     LoadedIndex、检索、rerank、fusion、API client、search audit
+frontend/     vanilla TypeScript 管理后台和前台
+tests/        API、检索、迁移、pipeline smoke tests
 ```
 
-不引入 SQLAlchemy、Alembic、Celery、Redis。
+当前不再强制“只保留 4 个 Python 文件”之外的所有职责都挤在同一处；但新增文件仍应有明确边界，避免把 pipeline 再继续扩大为通用工具箱。
 
----
+## 3. SQLite 策略
 
-## 2. 数据模型
-
-### 2.1 SQLite 策略
-
-每次创建连接执行 `PRAGMA foreign_keys=ON; journal_mode=WAL; busy_timeout=5000;`。
-
-不跨线程共享连接：HTTP 请求用短连接，后台 worker 用独立连接。默认 `check_same_thread=True`。
-
-事务内只做数据库写入；API 调用、矩阵组装、cache 导出在事务外。迁移用 `PRAGMA user_version`，不用 Alembic。
-
-### 2.2 8 张表
-
-#### sources / problems
+每次创建连接执行：
 
 ```sql
-CREATE TABLE sources (
-  key TEXT PRIMARY KEY,
-  name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE problems (
-  key TEXT PRIMARY KEY,
-  source_key TEXT NOT NULL REFERENCES sources(key),
-  title TEXT NOT NULL, url TEXT NOT NULL,
-  text_key TEXT NOT NULL REFERENCES artifacts(key),
-  enabled INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX idx_problems_filter ON problems(source_key, enabled, deleted);
+PRAGMA foreign_keys=ON;
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=60000;
 ```
 
-题面变更时插入新 `problem_text` artifact 并更新 `text_key`；删除为软删除 `deleted=1`。
+`connect_db()` 使用 `timeout=60.0`。HTTP 请求和后台 worker 都使用短连接；后台线程不得共享 connection。
 
-#### artifacts
+当前有一个进程内 writer-priority read/write lock：
 
-```sql
-CREATE TABLE artifacts (
-  key TEXT PRIMARY KEY,
-  kind TEXT NOT NULL CHECK(kind IN ('problem_text','rewrite','embedding')),
-  parent_key TEXT REFERENCES artifacts(key),
-  method_key TEXT, role TEXT,
-  text TEXT, data TEXT, blob BLOB,
-  status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed')),
-  error TEXT,
-  updated_at TEXT NOT NULL,
-  UNIQUE(kind, parent_key, method_key, role)
-);
-CREATE INDEX idx_artifacts_lookup ON artifacts(kind, parent_key, method_key, role, status);
-```
+- `db_read_connection(settings)`：读连接。
+- `db_write_connection(settings)`：写连接。
+- 目标是减少“多读者压住少写者”时的 `database is locked`。
+- 这不是跨进程锁；部署仍假设单 uvicorn worker。
 
-三种 artifact 的 data/blob 布局：
+迁移使用 `PRAGMA user_version`，不用 Alembic。当前 schema version 为 2。
 
-| kind | key 前缀 | parent_key | role | text | data | blob |
-|------|----------|------------|------|------|------|------|
-| problem_text | `t:` | null | null | 原始题面 | null | null |
-| rewrite | `r:` | text_key | `rewrite` | null | `{clean,statement,abstract,abstract_zh,usage,method_snapshot}` | null |
-| embedding | `e:` | rewrite_key | view 名 | null | `{dim,dtype,normalized,usage,method_snapshot}` | float32 向量 |
+## 4. 数据模型
 
-`method_snapshot` 保存生成时的完整 method 配置（runtime model/provider endpoint/api_key_env + identity/prompt/dim/normalize 等），用于事后追溯。
+当前 SQLite 共有 9 张业务表：
 
-核心语义：**派生产物由 `(kind, parent_key, method_key, role)` 唯一确定**。
+| 表 | 作用 |
+|----|------|
+| `sources` | 来源定义和启用状态 |
+| `problems` | 题目元数据，指向当前 `problem_text` artifact |
+| `artifacts` | `problem_text`、`rewrite`、`embedding` 产物 |
+| `indexes` | 不可变 index 版本及状态 |
+| `index_rows` | index 中每个 problem/view 的行映射 |
+| `jobs` | import/build/cleanup 等后台任务 |
+| `job_logs` | job 流式日志和错误详情 |
+| `search_audits` | 前台查询审计、耗时、API cost |
+| `kv` | `active_index_key` 等小型状态 |
 
-#### indexes / index_rows
+### 4.1 Artifacts
 
-```sql
-CREATE TABLE indexes (
-  key TEXT PRIMARY KEY,
-  status TEXT NOT NULL CHECK(status IN ('building','built','active','retired','failed')),
-  meta TEXT NOT NULL, created_at TEXT NOT NULL,
-  activated_at TEXT, error TEXT
-);
--- status=built 仅在 cache 导出并校验通过后设置。cache 导出失败时 status=failed。
+`artifacts` 当前不再记录 `attempts`。失败 artifact 可由管理员在 job 层手动 retry，不在 artifact 上自动累加重试次数。
 
-CREATE TABLE index_rows (
-  index_key TEXT NOT NULL REFERENCES indexes(key),
-  problem_ord INTEGER NOT NULL,
-  problem_key TEXT NOT NULL, view TEXT NOT NULL,
-  embedding_key TEXT NOT NULL REFERENCES artifacts(key),
-  title TEXT NOT NULL, url TEXT NOT NULL,
-  text_key TEXT NOT NULL, rewrite_key TEXT NOT NULL,
-  row_hash TEXT NOT NULL,
-  PRIMARY KEY(index_key, problem_ord, view),
-  UNIQUE(index_key, problem_key, view)
-);
-```
+三类 artifact：
 
-每个 problem 固定 4 行（clean/statement/abstract/abstract_zh），`problem_ord` 连续对齐。
+| kind | parent | role | content |
+|------|--------|------|---------|
+| `problem_text` | null | null | 原始题面文本 |
+| `rewrite` | `problem_text` | `rewrite` | JSON data: `clean`、`statement`、`abstract`、`abstract_zh`、usage、method snapshot |
+| `embedding` | `rewrite` | view name | float32 blob + dim/dtype/usage/method snapshot |
 
-#### jobs / search_audits / kv
+派生产物由 `(kind, parent_key, method_key, role)` 唯一确定。`method_key` 使用模型 identity 和影响输出的配置；不包含 provider endpoint 或 API key env。这样相同模型经不同 provider 路由时不会误判为不同语义版本。
 
-```sql
-CREATE TABLE jobs (
-  key TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK(type IN ('import','build_index','activate_index','cleanup')),
-  status TEXT NOT NULL CHECK(status IN ('draft','queued','running','succeeded','blocked','failed')),
-  payload TEXT NOT NULL, progress TEXT NOT NULL,
-  result TEXT, error TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-CREATE INDEX idx_jobs_queue ON jobs(status, created_at);
-CREATE INDEX idx_audits_time ON search_audits(started_at);
+### 4.2 Problems
 
-CREATE TABLE search_audits (
-  request_id TEXT PRIMARY KEY,
-  started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
-  client_ip TEXT, user_agent TEXT, query TEXT NOT NULL,
-  timings TEXT NOT NULL, api_calls TEXT NOT NULL,
-  result TEXT NOT NULL, cost TEXT NOT NULL, error TEXT
-);
+`problems.text_key` 指向当前题面 artifact。后台 problem detail 可以预览并修改 problem text；修改时插入新的 `problem_text` artifact 并更新 `text_key`，旧 artifact 保留用于追溯。
 
-CREATE TABLE kv (
-  key TEXT PRIMARY KEY,             -- active_index_key | schema_version | last_cleanup_at
-  value TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-```
+### 4.3 Jobs
 
-`blocked` = 部分 artifact 成功但仍有缺失/失败，不能创建完整 index，可 retry。
+`jobs.progress` 存储当前任务进度、取消请求、计数等结构化状态。`job_logs` 作为流式 result 展示来源；错误应写入 logs，而不是只在任务结束后塞一个 JSON。
 
-### 2.3 Key 规则
+取消语义：
 
-所有 key 为短前缀 + SHA-256 hex。
+- queued job 可直接取消。
+- running job 设置 `progress.cancel_requested = true`。
+- worker 在 rewrite/embedding/build 循环边界检查取消请求。
+- 取消不应把尚未开始的 artifact 计为失败。
 
-| Key | 公式 |
+## 5. Key 与版本
+
+所有内容 key 为短前缀 + SHA-256 hex。
+
+| Key | 语义 |
 |-----|------|
-| text_key | `t:` + sha256(canonical_text) |
-| method_key | `m:` + sha256(kind + model identity + prompt/config)，不包含 provider endpoint / api_key_env |
-| rewrite_key | `r:` + sha256(`rewrite` + text_key + rewrite_method_key + `rewrite`) |
-| embedding_key | `e:` + sha256(`embedding` + rewrite_key + embedding_method_key + view) |
-| row_hash | sha256(schema_version + problem_ord + problem_key + view + embedding_key + title + url + text_key + rewrite_key) |
-| index_key | `i:` + sha256(schema_version + rewrite_method_key + embedding_method_key + sorted(row_hashes)) |
+| `text_key` | canonicalized problem text |
+| `method_key` | kind + model identity + prompt/config |
+| `rewrite_key` | rewrite + text_key + rewrite_method_key |
+| `embedding_key` | embedding + rewrite_key + embedding_method_key + view |
+| `row_hash` | index row schema + problem/view/embedding/text metadata |
+| `index_key` | schema + rewrite method + embedding method + sorted row hashes |
 
-**`index_key` 不包含 search_config**（beta/rerank_top_k/fusion 等是查询时参数）。
+`index_key` 不包含 search-time 参数，例如 beta、rerank、top_display。
 
----
+## 6. Import
 
-## 3. 生成与构建流水线
+输入 JSONL 推荐字段：
 
-### 3.1 JSONL 导入
+```json
+{"id": "CodeForces/1234B", "title": "...", "text": "...", "url": "..."}
+```
 
-输入 schema: `{id, title, text, url}`。`source_key` 从 `id` 前缀派生。
-
-**dry-run**（`POST /admin/api/import/dry-run`）：校验→统计 new/overwrite/skip/errors→创建 `draft` job→返回 stats。不修改 problems/artifacts。
-
-**confirm**（`POST /admin/api/import/{job_key}/confirm`）：校验 job=draft、文件未变→改 status=queued→后台 worker 执行。
-
-三种 mode：
+`source_key` 从 `id` 前缀派生。当前 import mode：
 
 | Mode | 行为 |
 |------|------|
-| upsert | 新增或更新 title/url/text_key |
-| insert_only | 已存在则跳过 |
-| sync_source | 限定 source，缺失题 `enabled=0` |
+| `upsert` | 新增或更新 title/url/text |
+| `insert_only` | 已存在题目跳过 |
+| `sync_source` | 同步某来源，缺失题目置为 disabled |
 
-### 3.2 可恢复 Artifact 生成
+流程：
 
-**原则**：每个成功 artifact 立即原子写回 SQLite 作为 checkpoint。中断后从 pending/failed 缺口继续。已 succeeded 的永远复用。
+1. `POST /admin/api/import/dry-run` 上传并校验文件，创建 draft job。
+2. `POST /admin/api/import/{key}/confirm` 把 draft 入队执行。
+3. `DELETE /admin/api/import/{key}` 删除尚未 confirm 的 draft。
 
-状态机：`pending → running → succeeded | failed`。服务重启时 `running → pending`。
+当前 imports 页面第一行显示原始文件名，便于识别。
 
-**rewrite**（`ensure_rewrite`）：计算 rewrite_key → INSERT OR IGNORE pending → 已 succeeded 直接复用 → 否则通过 OpenRouter 调 rewrite 模型 → 解析四段 → 短事务写回。
+## 7. Artifact 生成与 Index Build
 
-**rewrite 并发 + embedding 批量**：先按 `rewrite_concurrency=16` 并发生成 pending rewrite artifacts；全部 rewrite 完成后，收集 pending embedding artifacts → 按 `embedding_batch_size=128` 分批 → 标记 running → 事务外调 `embed_texts()` → L2 normalize → 逐条短事务写回 succeeded。
+Build job 使用 snapshot，保证 retry blocked job 时仍基于同一批题目，不被后台之后的 problem 修改影响。
 
-**失败处理**：单个 artifact 失败不影响其他；artifact 不记录重试次数。失败后由管理员在 job 层手动 retry。
-
-### 3.3 索引构建
-
-`POST /admin/api/index/build` → 创建 queued `build_index` job。
+当前流程：
 
 ```text
-1. 读取 enabled problems → 持久化到 data/builds/<job_key>/snapshot.jsonl
-   jobs.payload 保存 snapshot_path / rewrite_method_key / embedding_method_key
-2. 逐题 ensure_rewrite + ensure_embedding（复用已有）
-3. 有 failed artifact → job=blocked，不创建 index
-4. 全部 succeeded → 写 index_rows，逐行算 row_hash
-5. hash-of-hashes 算 index_key → 写 indexes(status=building)
-6. 导出 .npy cache（用 open_memmap 按行写入，避免全量 RAM 峰值）
-7. cache 校验通过 → indexes.status=built → job=succeeded
-   cache 导出失败 → indexes.status=failed → job=failed
+1. 读取 enabled problems，写 build snapshot。
+2. 批量生成缺失 rewrite；已有 succeeded rewrite 直接复用。
+3. 所有 rewrite 处理完后，收集缺失 embedding。
+4. embedding 按 batch 调 API，并发处理多个 batch。
+5. 所有四视图 embedding 齐全后写 index_rows。
+6. 导出 .npy cache 到临时目录。
+7. 校验通过后发布 cache 并把 index 标记 built。
 ```
 
-retry blocked build **必须使用原 snapshot**，不重新读取当前 problems。新建 build 才读新状态。
+当前并发配置：
 
-### 3.4 .npy Cache
+```toml
+[jobs]
+poll_seconds = 2
+rewrite_concurrency = 32
+embedding_concurrency = 4
+embedding_batch_size = 128
+```
 
-每个 index 导出到 `data/index_cache/<index_key>/`：
+rewrite 使用线程池并发逐题请求。embedding 使用 batch API；每个 batch 最多 `embedding_batch_size` 条文本，同时最多 `embedding_concurrency` 个 batch in flight。
+
+失败策略：
+
+- 单个 artifact 失败不阻塞其他 artifact。
+- 失败写入 `job_logs`，后台 Job detail 可查看 problem key、phase、error。
+- rewrite 输出有结构质量门：`clean`、`statement`、`abstract`、`abstract_zh` 任一 view 超过 `10_000` 字符则判为 rewrite failed。
+- 构建结束时如果仍有失败或缺失 artifact，job 进入 blocked/failed，不创建完整 active index。
+- retry failed job 时应跳过已 succeeded artifact，只处理缺口。
+
+## 8. Cache 与启动
+
+每个 index 导出到：
 
 ```text
-manifest.json          schema/dim/文件清单
-problems.jsonl         ord/key/title/url/text_key/rewrite_key
-views.jsonl            ord/key/clean/statement/abstract/abstract_zh
-clean.npy              float32 [N, dim]
-statement.npy          float32 [N, dim]
-abstract.npy           float32 [N, dim]
-abstract_zh.npy        float32 [N, dim]
+data/index_cache/<index_key>/
+  manifest.json
+  problems.jsonl
+  views.jsonl
+  clean.npy
+  statement.npy
+  abstract.npy
+  abstract_zh.npy
 ```
 
-导出使用 `numpy.lib.format.open_memmap(path, mode='w+', dtype=float32, shape=(N, dim))` 按行写入，避免构建时 ~12 GiB RAM 峰值。写完后导出到临时目录 `.building/`，校验通过后 rename 到正式目录。Cache 不作为公开静态文件暴露。
+导出使用临时目录，校验通过后原子替换正式 cache 目录。默认 load mode 为 `mmap`。
 
-**启动加载**：读 `kv.active_index_key` → cache hit（manifest.index_key 匹配 + shape/dtype 正确）直接 `np.load` → cache miss 从 SQLite 重建 cache → 重建也失败则 degraded。启动时不做 hash 校验；完整性校验通过管理 API `POST /admin/api/index/{key}/verify` 按需执行。
+启动时读取 `kv.active_index_key` 并尝试加载 cache：
 
-默认 `mmap_mode="r"` 加载，降低内存峰值。也支持 RAM 全量加载。
+- 加载成功：`IndexState.current = LoadedIndex`。
+- 加载失败：记录 `indexes.error = "startup load failed: ..."`，服务 degraded 启动，前台搜索返回无索引错误，后台仍可进入并修复。
 
----
+手动 activate 仍保持严格语义：目标 cache 加载失败时 API 返回错误，不更新 `active_index_key`。
 
-## 4. 索引激活与搜索
+## 9. Active Index 与搜索
 
-### 4.1 IndexState 与切换策略
+`IndexState` 持有当前 active index：
 
-```python
-class IndexState:
-    current: LoadedIndex | None
-    switching: bool           # True 时新搜索返回 503
-    inflight_searches: int    # drain 到 0 后才释放旧索引
-    condition: threading.Condition
-```
+- `current`
+- `switching`
+- `inflight_searches`
+- `condition`
 
-激活流程按 load_mode 区分：
-
-**mmap 模式**（mmap 不立即占物理 RAM，可以先构造新索引再切换）：
+搜索流程：
 
 ```text
-1. 预打开新 cache 的 manifest + 四个 npy memmap，校验 shape/dtype
-2. 构造新 LoadedIndex 对象（此时新旧共存但 mmap 不占大量物理内存）
-3. switching=True，等待 inflight_searches=0（超时 activation_drain_timeout_seconds=30 后失败）
-4. current = new，释放旧对象 → switching=False
+POST /api/search
+  -> optional query rewrite, returns four views
+  -> embed four query views
+  -> retrieve up to top_retrieval candidates from active index
+  -> rerank window
+  -> calibrated fusion
+  -> NDJSON stream events
+  -> write search_audits
 ```
 
-**RAM 模式**（全量加载，避免 12 GiB 双份峰值）：
+当前 rerank 规则：
+
+- `rerank_top_k = 0` 表示对全部 `top_retrieval` candidates rerank。
+- 正数表示先截断到 topK 再 rerank。
+
+排序规则：
 
 ```text
-1. 预校验目标 cache manifest
-2. switching=True，等待 inflight_searches=0（同上超时）
-3. 释放旧 LoadedIndex → gc.collect()
-4. 从 cache 全量加载新 LoadedIndex
-5. current = new → switching=False
+final_score desc
+rerank_score desc
+embedding_score desc
+problem_key asc
 ```
 
-失败回滚：尝试重新加载旧 cache；若也失败则 degraded（503）。
-更新 `kv.active_index_key` 在 current 替换成功后写入。
-
-### 4.2 搜索流程
+## 10. 公开 API
 
 ```text
-POST /api/search → 检查 switching/索引可用
-  → OpenRouter rewrite query 为 4 view
-  → Qwen embedding 4 个 query vector（L2 normalized）
-  → all_query_best_doc_top50_union 召回
-  → rerank_top_k=0 时保留全部 top_retrieval；rerank_top_k>0 时按 embedding_score 截断到 topK
-  → Qwen reranker
-  → calibrated_floor fusion
-  → NDJSON stream 返回
-  → 写 search_audits
+GET  /api/health
+GET  /api/config
+POST /api/search        NDJSON stream
 ```
 
-### 4.3 Retrieval: all_query_best_doc_top50_union
+`/api/search` 返回 candidates 时包含四个 view：`clean`、`statement`、`abstract`、`abstract_zh`。前端将 `clean` 显示为 `Filtered`，将 `abstract_zh` 显示为 `中文`。
 
-对每个 doc view（clean/statement/abstract/abstract_zh）：
+返回结果包含 cost。前端在结果数量旁展示估算费用：英文 view 显示 `$`，中文 view 显示按 `1 USD = 7 CNY` 估算的 `￥`。
 
-```text
-score[i] = max(cosine(doc_view[i], q) for q in [q_clean, q_statement, q_abstract, q_abstract_zh])
-```
+## 11. 管理 API
 
-实现时 stack 4 个 query vector 为 `Q = [dim, 4]`，每个 doc view 做一次 GEMM `scores = matrix @ Q`，再 `max(axis=1)`。共 4 次 GEMM 而非 16 次 GEMV，对 mmap page fault 和 CPU cache 更友好。
-
-每个 doc view 取 top 50 → 四个 top50 union → 按 problem_key 去重保留最高 embedding_score → 最多 200 candidates。
-
-### 4.4 Rerank & Fusion
-
-Rerank pair：`query.abstract_zh` vs `candidate.clean + "\n\n" + candidate.statement`。默认 `rerank_top_k=0`，表示对全部 top_retrieval candidates rerank；正数 topK 表示仅保留该 topK 进入 rerank/fusion。
-
-Calibrated floor fusion：
-
-```text
-r, e ∈ [0,1]（clipped）
-S_r = max(r_max - r_min, 0.1)
-S_e = max(e_max - e_min, 0.05)
-λ = ((1-β)/β) × (S_r/S_e),  β=0.75
-final = (r + λe) / (1 + λ)
-```
-
-排序：final_score desc → rerank_score desc → embedding_score desc → problem_key asc。
-
-### 4.5 搜索审计
-
-每次 `/api/search` 写一行 `search_audits`，记录 query 原文、client_ip、user_agent、timings、api_calls（含 pricing snapshot）、result、cost（microusd）。
-
-Cost 估算：pricing 放 config.toml，按 token usage 或 pair count 计算。每条 api_call 保留当时的 pricing snapshot。
-
----
-
-## 5. 管理后台
-
-### 5.1 API
+所有管理端点在 `/admin/api/*` 下，需要 session + CSRF。
 
 | 分组 | 端点 |
 |------|------|
-| Auth | `POST login` · `POST logout` · `GET me` |
-| Dashboard | `GET dashboard` |
-| Import | `POST import/dry-run` · `POST import/{key}/confirm` · `GET imports` · `GET imports/{key}` |
-| Problems | `GET problems` · `PATCH problems/{key}` · `POST problems/batch-{enable,disable,delete,restore}` |
-| Sources | `GET sources` · `PATCH sources/{key}` |
-| Indexes | `POST index/build` · `GET indexes` · `GET indexes/{key}` · `POST index/{key}/activate` · `POST index/{key}/cache/rebuild` |
-| Jobs | `GET jobs` · `GET jobs/{key}` · `POST jobs/{key}/retry` |
-| Audits | `GET audits` · `GET audits/{id}` |
-| Settings | `GET settings`（只读，不返回 secrets） |
+| Auth | `POST /auth/login` · `POST /auth/logout` · `GET /auth/me` |
+| Dashboard | `GET /dashboard` |
+| Problems | `GET /problems` · `GET /problems/{key}` · `PATCH /problems/{key}` · `POST /problems/batch-{action}` |
+| Sources | `GET /sources` · `PATCH /sources/{key}` |
+| Import | `POST /import/dry-run` · `POST /import/{key}/confirm` · `DELETE /import/{key}` · `GET /imports` · `GET /imports/{key}` |
+| Jobs | `GET /jobs` · `GET /jobs/{key}` · `POST /jobs/{key}/retry` · `POST /jobs/{key}/cancel` · `POST /jobs/cleanup` |
+| Indexes | `POST /index/build` · `GET /indexes` · `GET /indexes/{key}` · `POST /index/{key}/activate` · `POST /index/{key}/cache/rebuild` · `POST /index/{key}/verify` |
+| Audits | `GET /audits` · `GET /audits/{id}` |
+| Settings | `GET /settings` |
 
-所有端点在 `/admin/api/*` 下。`cache/rebuild` 从 SQLite 重建 `.npy` cache。
+Dashboard 当前展示：
 
-### 5.2 认证与 CSRF
+- enabled problem count。
+- 有 succeeded rewrite 的 problem count。
+- 有完整 succeeded embedding 的 problem count。
+- active index 中 problem count。
+- 当前 active/running jobs。
 
-单管理员，密码 hash 来自环境变量。使用 `itsdangerous` 签名 cookie。
+## 12. 认证与 Secrets
 
-登录设两个 cookie：`admin_session`（HttpOnly，含 sub/exp/csrf）+ `admin_csrf`（非 HttpOnly，前端可读）。
+后台是单管理员模式：
 
-非 GET 请求：校验 session 签名 + exp → session 内 csrf = cookie csrf = `X-CSRF-Token` header 三者一致 → 校验 Origin/Referer。Session TTL 8 小时。
+- 密码 hash 文件：`data/admin_password.hash`。
+- session signing secret 文件：`data/admin_signing_secret`。
 
-### 5.3 前端 UI
+登录后设置：
 
-继续 vanilla TypeScript。9 个页面：
+- `admin_session`：HttpOnly signed cookie。
+- `admin_csrf`：非 HttpOnly，用于 `X-CSRF-Token`。
 
-| 页面 | 核心功能 |
-|------|----------|
-| Login | 密码登录 |
-| Dashboard | 题目数/来源数/active index/当前 job/今日查询统计 |
-| Imports | 上传 JSONL → 选 mode → dry-run → 查看 stats/errors → confirm |
-| Problems | 分页表格 + 按 source/enabled/deleted/关键词过滤 + 编辑/启用/禁用/软删除/批量操作 |
-| Sources | 来源统计 + 启用/禁用 + 跳转该 source 的 problems |
-| Indexes | 构建/查看/激活/回滚/手动 rebuild cache |
-| Jobs | 分页 + 查看 progress/result/error + blocked build retry |
-| Audits | 按时间/状态/query 过滤 + 详情展示 timings/cost/result JSON |
-| Settings | 只读展示模型配置/method keys/搜索参数/存储/active index |
+非 GET 请求校验 session、CSRF cookie、`X-CSRF-Token`、Origin/Referer。
 
-### 5.4 上传安全
+模型 API key 仍通过环境变量读取，后台可以展示配置但不返回 secret 值。
 
-限制文件大小/单行大小/字段长度/总行数。随机文件名，上传目录不在静态目录下。展示题面/query/错误摘要时 HTML escape。日志不输出 API key/Cookie/Authorization。
-
----
-
-## 6. 运维
-
-### 6.1 后台 Job Worker
-
-单 worker 串行执行 import → build_index → activate_index → cleanup。不做 heartbeat/lease/多 worker。
-
-服务启动恢复：`running jobs → queued`，`running artifacts → pending`，清理 `.building` 残留，加载 active index cache，启动 worker。
-
-### 6.2 Cleanup Job
-
-```text
-1. 删除超过 retention_days 的 search_audits（默认 90 天）
-2. 删除过期上传临时文件
-3. 清理 .building 残留目录
-4. 旧 index cache：保留 active + 最近 3 个 built/retired
-```
-
-不删除 succeeded artifacts（canonical store）。
-
-### 6.3 失败恢复
-
-| 场景 | 恢复 |
-|------|------|
-| Build 中断 | succeeded artifacts 保留，running → pending，retry 继续 |
-| Build blocked | 不创建 index，retry 只处理缺失项 |
-| Activate 失败 | 回滚旧 cache 或 degraded(503) |
-| Import 失败 | 已提交数据保留，用户重新导入 |
-| 搜索失败 | 返回 error event，audit status=failed |
-
-### 6.4 备份
-
-必须备份：`data/app.sqlite3{,-wal,-shm}` + `data/uploads/` + `data/index_cache/` + `config.toml`。恢复后启动服务即可（cache hit 直接加载）。
-
----
-
-## 7. 公开 API
-
-```text
-GET  /api/health    → {ok, loaded_index_key, problem_count, embedding_shape, views, switching}
-GET  /api/config    → 检索参数
-POST /api/search    → NDJSON stream: request → rewrite → embedding → candidates → rerank → results → done | error
-```
-
-`switching=true` 或无索引时返回 503。浏览器前端只通过 API 获取数据，不读 SQLite 或 `.npy`。
-
----
-
-## 8. 配置
+## 13. 当前配置
 
 ```toml
 [storage]
@@ -439,41 +304,38 @@ index_cache_dir = "data/index_cache"
 
 [admin]
 session_hours = 8
-
-[limits]
-upload_max_bytes = 104857600
-jsonl_max_line_bytes = 1048576
-field_max_text_chars = 200000
+password_hash_file = "data/admin_password.hash"
+signing_secret_file = "data/admin_signing_secret"
 
 [jobs]
 poll_seconds = 2
-rewrite_concurrency = 16
+rewrite_concurrency = 32
+embedding_concurrency = 4
 embedding_batch_size = 128
+
+[api]
+request_timeout = 240
 
 [search]
 top_per_doc_view = 50
+top_retrieval = 200
+top_display = 20
 rerank_top_k = 0
 beta = 0.75
+default_rerank = true
 rerank_range_floor = 0.1
 embedding_range_floor = 0.05
 
 [index_cache]
 keep_retired = 3
-load_mode = "mmap"                # mmap | ram
+load_mode = "mmap"
 activation_drain_timeout_seconds = 30
 
-[audit]
-retention_days = 90
-
-[audit.pricing.openrouter."deepseek/deepseek-v4-flash"]
-input_price_per_1m_tokens_microusd = 90000
-output_price_per_1m_tokens_microusd = 180000
-
 [models.rewrite]
-model = "deepseek/deepseek-v4-flash"
+model = "deepseek-v4-flash"
 identity = "deepseek-v4-flash"
-url = "https://openrouter.ai/api/v1/chat/completions"
-api_key_env = "OPENROUTER_API_KEY"
+url = "https://api.deepseek.com/chat/completions"
+api_key_env = "DEEPSEEK_API_KEY"
 
 [models.embedding]
 model = "Qwen/Qwen3-Embedding-8B"
@@ -486,40 +348,51 @@ url = "https://api.deepinfra.com/v1/inference/{model}"
 api_key_env = "DEEPINFRA_API_KEY"
 ```
 
----
+Pricing 当前按 provider/model 存在 `[audit.pricing.*]` 下，search audit 写入当时的 pricing snapshot。
 
-## 9. 实施阶段
+## 14. 前端状态
 
-| Phase | 内容 | 关键产出 |
-|-------|------|----------|
-| 1 | 依赖更新 + 文件重组为 4 文件 | 现有 `/api/search` 仍可运行 |
-| 2 | SQLite connect/migrate + 8 张表 + kv | `core.py` 数据层 |
-| 3 | 认证 + signed cookie + double-submit CSRF | `app.py` 中间件 |
-| 4 | JSONL upload/dry-run/confirm + import job | `pipeline.py` 导入 |
-| 5 | 四视图 rewrite parser + embedding batch | `pipeline.py` artifact 生成 |
-| 6 | 可恢复 build + blocked/retry + hash-of-hashes index_key | `pipeline.py` 构建 |
-| 7 | .npy cache export + manifest + startup load + mmap | `pipeline.py` 发布 |
-| 8 | IndexState switching + drain + 释放旧 + 加载新 + rollback | `search.py` 激活 |
-| 9 | 四视图 query rewrite/embedding + retrieval + rerank + fusion | `search.py` 搜索 |
-| 10 | search_audits + pricing config + cost 估算 | `search.py` 审计 |
-| 11 | 管理后台 9 个页面 | 前端 vanilla TS |
-| 12 | cleanup job + cache 清理 + audit retention + 部署文档 + 完整测试 | 运维闭环 |
+前台是 vanilla TypeScript，不使用 React/MUI/AntD。当前主要交互：
 
----
+- 查询输入自适应高度。
+- NDJSON streaming search。
+- Rewrite 完成后在阶段旁显示编辑按钮。
+- Sort 和 View 使用下拉选择，选项写入 localStorage。
+- 结果列表显示标题、来源链接、statement/view 内容、主分数、rr/emb 小条。
+- LaTeX 使用 Temml/MathML 渲染，并定制复制行为。
 
-## 10. 验收标准
+后台同样是 vanilla TypeScript，当前实现 Dashboard、Imports、Problems、Sources、Indexes、Jobs、Audits、Settings。
 
-```text
-可以导入 JSONL 并 dry-run/confirm。
-可以查看/启用/禁用/软删除题目和来源。
-可以构建四视图索引，rewrite/embedding 中断后可继续。
-单个 rewrite 失败不丢弃已完成结果。
-不完整索引不被创建/激活。
-index 构建后导出 .npy cache，启动从 cache 加载。
-索引切换锁定搜索，避免双份内存。
-可以激活新索引、回滚旧索引。
-搜索使用四视图 top50 union + rerank + calibrated_floor。
-每次查询记录 query/IP/UA/API 开销。
-index_key 不受 search_config 变化影响。
-管理后台可完成全部管理操作闭环。
+## 15. 已知待修
+
+这些是当前实现和理想状态之间仍然存在的明确差距：
+
+1. RAM load mode 的 activate 仍可能先加载新索引再释放旧索引，存在双份内存峰值风险。
+2. Build、Cleanup、Rebuild 等高风险后台操作还缺少二次 confirm。
+3. Problems 页面已有单题编辑，但批量选择 UI 仍不完整。
+4. Activate 失败后的回滚策略还需要更严格的端到端测试。
+5. `pipeline.py`、`admin.ts`、`core.py` 仍偏大，需要后续按职责继续收敛。
+6. `extract_title`、`read_jsonl_list` / `_read_snapshot` 等疑似旧 helper 需要继续清理或合并。
+
+## 16. 验收
+
+后端改动：
+
+```powershell
+python -m pytest tests -q -p no:cacheprovider
 ```
+
+前端改动：
+
+```powershell
+cd frontend
+npm run build
+```
+
+涉及前端布局或交互时，还需要在浏览器中检查：
+
+- 初始页、搜索中、搜索完成。
+- Rewrite 编辑浮层。
+- Sort/View 切换。
+- 窄屏结果布局。
+- Admin Dashboard、Problems、Jobs、Indexes。
