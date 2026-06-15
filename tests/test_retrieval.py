@@ -98,7 +98,7 @@ def test_sqlite_migration(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    assert version == 1
+    assert version == 2
     assert {
         "sources",
         "problems",
@@ -106,6 +106,7 @@ def test_sqlite_migration(tmp_path: Path) -> None:
         "indexes",
         "index_rows",
         "jobs",
+        "job_logs",
         "search_audits",
         "kv",
     }.issubset(tables)

@@ -109,6 +109,7 @@ def run_next_job(settings: Settings) -> bool:
         else:
             _mark_job_failed(settings, job["key"], f"unsupported job type: {job['type']}")
     except Exception as exc:
+        append_job_log(settings, job["key"], "error", "Job failed", {"error": str(exc)})
         _mark_job_failed(settings, job["key"], str(exc))
     return True
 
@@ -440,10 +441,10 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                         """
                         INSERT OR IGNORE INTO artifacts(
                           key, kind, parent_key, method_key, role, text, data, blob,
-                          status, attempts, error, updated_at
+                          status, error, updated_at
                         )
                         VALUES (?, 'problem_text', NULL, NULL, NULL, ?, NULL, NULL,
-                                'succeeded', 0, NULL, ?)
+                                'succeeded', NULL, ?)
                         """,
                         (problem_text_key, row.text, now),
                     )
@@ -534,10 +535,10 @@ def ensure_rewrite_artifact(
                 """
                 INSERT OR IGNORE INTO artifacts(
                   key, kind, parent_key, method_key, role, text, data, blob,
-                  status, attempts, error, updated_at
+                  status, error, updated_at
                 )
                 VALUES (?, 'rewrite', ?, ?, 'rewrite', NULL, NULL, NULL,
-                        'pending', 0, NULL, ?)
+                        'pending', NULL, ?)
                 """,
                 (selected_rewrite_key, problem_text_key, selected_method_key, now),
             )
@@ -546,14 +547,12 @@ def ensure_rewrite_artifact(
         )
         if artifact["status"] == "succeeded":
             return artifact
-        if artifact["status"] == "failed" and artifact["attempts"] >= settings.jobs.rewrite_max_attempts:
-            raise ValueError("rewrite artifact exceeded max attempts")
 
         with conn:
             conn.execute(
                 """
                 UPDATE artifacts
-                SET status = 'running', attempts = attempts + 1, error = NULL, updated_at = ?
+                SET status = 'running', error = NULL, updated_at = ?
                 WHERE key = ?
                 """,
                 (utc_now(), selected_rewrite_key),
@@ -610,10 +609,10 @@ def ensure_embedding_artifacts(
                     """
                     INSERT OR IGNORE INTO artifacts(
                       key, kind, parent_key, method_key, role, text, data, blob,
-                      status, attempts, error, updated_at
+                      status, error, updated_at
                     )
                     VALUES (?, 'embedding', ?, ?, ?, NULL, NULL, NULL,
-                            'pending', 0, NULL, ?)
+                            'pending', NULL, ?)
                     """,
                     (
                         embedding_key(selected_rewrite_key, selected_method_key, view),
@@ -641,7 +640,6 @@ def ensure_embedding_artifacts(
         view
         for view in VIEWS
         if artifacts[view]["status"] != "succeeded"
-        and artifacts[view]["attempts"] < settings.jobs.embedding_max_attempts
     ]
     if not pending_views:
         return {view: artifacts[view] for view in VIEWS}
@@ -725,7 +723,7 @@ def _mark_artifacts_running(settings: Settings, artifact_keys: list[str]) -> Non
             conn.execute(
                 f"""
                 UPDATE artifacts
-                SET status = 'running', attempts = attempts + 1, error = NULL, updated_at = ?
+                SET status = 'running', error = NULL, updated_at = ?
                 WHERE key IN ({placeholders})
                 """,
                 [utc_now(), *artifact_keys],
@@ -831,6 +829,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             )
 
     snapshot = _read_snapshot(Path(payload["snapshot_path"]))
+    append_job_log(settings, job_key, "info", "Build index started", {"total": len(snapshot)})
     selected_rewrite_method_key = str(payload["rewrite_method_key"])
     selected_embedding_method_key = str(payload["embedding_method_key"])
     prepared: list[dict[str, Any]] = []
@@ -858,16 +857,24 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                 view for view, artifact in embeddings.items() if artifact["status"] != "succeeded"
             ]
             if failed_embeddings:
-                failures.append(
-                    {
-                        "problem_key": problem["key"],
-                        "error": f"embedding failed for views: {', '.join(failed_embeddings)}",
-                    }
-                )
+                failure = {
+                    "problem_key": problem["key"],
+                    "error": f"embedding failed for views: {', '.join(failed_embeddings)}",
+                }
+                failures.append(failure)
+                append_job_log(settings, job_key, "error", "Embedding failed", failure)
             else:
                 prepared.append({"problem": problem, "rewrite": rewrite, "embeddings": embeddings})
         except Exception as exc:
-            failures.append({"problem_key": problem["key"], "error": str(exc)})
+            if _cancel_requested(settings, job_key):
+                return _finish_if_cancel_requested(
+                    settings,
+                    job_key,
+                    {"failures": failures, "processed": position - 1, "total": len(snapshot)},
+                ) or _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
+            failure = {"problem_key": problem["key"], "error": str(exc)}
+            failures.append(failure)
+            append_job_log(settings, job_key, "error", "Artifact generation failed", failure)
 
         _update_job_progress(
             settings,
@@ -882,6 +889,13 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         )
 
     if failures:
+        append_job_log(
+            settings,
+            job_key,
+            "warning",
+            "Build index blocked",
+            {"failures": len(failures), "total": len(snapshot)},
+        )
         return _finish_job(settings, job_key, "blocked", {"failures": failures}, None)
 
     rows, row_hashes = _build_index_rows(prepared)
@@ -954,6 +968,13 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                     """,
                     (selected_index_key,),
                 )
+        append_job_log(
+            settings,
+            job_key,
+            "info",
+            "Build index succeeded",
+            {"index_key": selected_index_key, "cache_path": str(cache_path)},
+        )
         return _finish_job(
             settings,
             job_key,
@@ -968,6 +989,13 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                     "UPDATE indexes SET status = 'failed', error = ? WHERE key = ?",
                     (str(exc), selected_index_key),
                 )
+        append_job_log(
+            settings,
+            job_key,
+            "error",
+            "Index export failed",
+            {"index_key": selected_index_key, "error": str(exc)},
+        )
         return _finish_job(
             settings,
             job_key,
@@ -1322,14 +1350,57 @@ def get_problem(settings: Settings, problem_key: str) -> dict[str, Any] | None:
             SELECT
               p.key, p.source_key, p.title, p.url, p.text_key,
               p.enabled, p.deleted, p.updated_at,
-              a.text
+              a.text,
+              a.status AS text_status,
+              a.error AS text_error,
+              a.updated_at AS text_updated_at
             FROM problems p
             JOIN artifacts a ON a.key = p.text_key AND a.kind = 'problem_text'
             WHERE p.key = ?
             """,
             (problem_key,),
         ).fetchone()
-    return row_to_dict(row) if row else None
+        if row is None:
+            return None
+        problem = row_to_dict(row)
+        rewrites = [
+            row_to_dict(rewrite)
+            for rewrite in conn.execute(
+                """
+                SELECT key, method_key, status, error, updated_at
+                FROM artifacts
+                WHERE kind = 'rewrite'
+                  AND parent_key = ?
+                ORDER BY updated_at DESC, key
+                """,
+                (problem["text_key"],),
+            ).fetchall()
+        ]
+        for rewrite in rewrites:
+            embeddings = [
+                row_to_dict(embedding)
+                for embedding in conn.execute(
+                    """
+                    SELECT key, method_key, role, status, error, updated_at
+                    FROM artifacts
+                    WHERE kind = 'embedding'
+                      AND parent_key = ?
+                    ORDER BY role
+                    """,
+                    (rewrite["key"],),
+                ).fetchall()
+            ]
+            rewrite["embeddings"] = embeddings
+        problem["artifacts"] = {
+            "problem_text": {
+                "key": problem["text_key"],
+                "status": problem["text_status"],
+                "error": problem["text_error"],
+                "updated_at": problem["text_updated_at"],
+            },
+            "rewrites": rewrites,
+        }
+    return problem
 
 
 def patch_problem(settings: Settings, problem_key: str, changes: dict[str, Any]) -> dict[str, Any]:
@@ -1392,7 +1463,7 @@ def list_sources(settings: Settings) -> list[dict[str, Any]]:
             SELECT
               s.key, s.name, s.enabled, s.updated_at,
               count(p.key) AS problem_count,
-              sum(CASE WHEN p.enabled = 1 AND p.deleted = 0 THEN 1 ELSE 0 END) AS active_count,
+              sum(CASE WHEN p.enabled = 1 AND p.deleted = 0 THEN 1 ELSE 0 END) AS enabled_problem_count,
               sum(CASE WHEN p.deleted = 1 THEN 1 ELSE 0 END) AS deleted_count
             FROM sources s
             LEFT JOIN problems p ON p.source_key = s.key
@@ -1456,6 +1527,39 @@ def list_jobs(
     return [row_to_dict(row) for row in rows]
 
 
+def append_job_log(
+    settings: Settings,
+    job_key: str,
+    level: Literal["info", "warning", "error"],
+    message: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO job_logs(job_key, level, message, data, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job_key, level, message, json_dumps(data) if data is not None else None, utc_now()),
+            )
+
+
+def list_job_logs(settings: Settings, job_key: str, limit: int = 500) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 2000))
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM job_logs
+            WHERE job_key = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (job_key, limit),
+        ).fetchall()
+    return list(reversed([row_to_dict(row) for row in rows]))
+
+
 def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
     job = get_job(settings, job_key)
     if job is None:
@@ -1472,6 +1576,7 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
                 """,
                 (json_dumps({"phase": "queued"}), utc_now(), job_key),
             )
+    append_job_log(settings, job_key, "info", "Job queued for retry")
     return get_job(settings, job_key) or job
 
 
@@ -1514,6 +1619,7 @@ def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
                     """,
                     (json_dumps(progress), json_dumps(result), now, job_key),
                 )
+    append_job_log(settings, job_key, "warning", "Cancellation requested")
     updated = get_job(settings, job_key)
     if updated is None:
         raise ValueError("job not found after cancel")
@@ -1764,6 +1870,7 @@ def _finish_if_cancel_requested(
         return None
     payload = dict(result or {})
     payload["canceled"] = True
+    append_job_log(settings, job_key, "warning", "Job canceled")
     return _finish_job(settings, job_key, "failed", payload, "Canceled by admin")
 
 

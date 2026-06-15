@@ -466,7 +466,7 @@ function renderProblems(data: Row = {}): string {
         ])}
         ${select("deleted", filters.deleted, [
           ["", "Deleted: any"],
-          ["false", "Active only"],
+          ["false", "Not deleted"],
           ["true", "Deleted only"]
         ])}
         <button type="submit">Apply</button>
@@ -496,7 +496,7 @@ function problemRow(item: Row): string {
       <td>${flag(deleted)}</td>
       <td>${shortDate(item.updated_at)}</td>
       <td class="admin-actions">
-        <button data-edit-problem="${escapeHtml(key)}" type="button">Preview</button>
+        <button data-edit-problem="${escapeHtml(key)}" type="button">Detail</button>
         <button data-problem-patch="${escapeHtml(key)}" data-enabled="${enabled ? "false" : "true"}" type="button">
           ${enabled ? "Disable" : "Enable"}
         </button>
@@ -510,8 +510,17 @@ function problemRow(item: Row): string {
 function renderProblemEditor(problem: Row): string {
   return detailPanel(
     "Problem detail",
-    `
-      <form id="problemEditForm" class="admin-edit-form">
+    detailGrid([
+      ["ID", problem.key, "key"],
+      ["Source", problem.source_key],
+      ["Enabled", truthy(problem.enabled) ? "Yes" : "No"],
+      ["Deleted", truthy(problem.deleted) ? "Yes" : "No"],
+      ["Updated", problem.updated_at, "date"],
+      ["URL", problem.url],
+    ]) +
+      artifactStatusBlock(problem) +
+      `
+      <form id="problemEditForm" class="admin-edit-form admin-problem-form">
         <label>ID<input name="key" value="${escapeHtml(String(problem.key || ""))}" readonly></label>
         <label>Title<input name="title" value="${escapeHtml(String(problem.title || ""))}"></label>
         <label>URL<input name="url" value="${escapeHtml(String(problem.url || ""))}"></label>
@@ -541,7 +550,7 @@ function renderSources(data: Row = {}): string {
           <td>${escapeHtml(String(item.name || ""))}</td>
           <td>${flag(enabled)}</td>
           <td>${value(item.problem_count)}</td>
-          <td>${value(item.active_count)}</td>
+          <td>${value(item.enabled_problem_count)}</td>
           <td>${value(item.deleted_count)}</td>
           <td class="admin-actions">
             <button data-source-toggle="${escapeHtml(key)}" data-enabled="${enabled}" type="button">
@@ -553,7 +562,7 @@ function renderSources(data: Row = {}): string {
     })
     .join("");
   return table(
-    ["ID", "Name", "Enabled", "Problems", "Active", "Deleted", ""],
+    ["ID", "Name", "Enabled", "Problems", "Enabled problems", "Deleted", ""],
     items || emptyRow(7)
   );
 }
@@ -663,7 +672,7 @@ function renderJobDetail(job: Row): string {
       ["Progress", formatProgress(job.type, job.progress)]
     ]) +
       jsonBlock("Payload", job.payload) +
-      jsonBlock("Result", job.result) +
+      logBlock("Result", asRows(job.logs)) +
       jsonBlock("Error", job.error) +
       (isActiveJobStatus(status)
         ? `<button data-cancel-job="${escapeHtml(String(job.key || ""))}" type="button">Cancel</button>`
@@ -829,6 +838,118 @@ function jsonBlock(title: string, raw: unknown): string {
     </div>`;
 }
 
+function artifactStatusBlock(problem: Row): string {
+  const artifacts = asRecord(problem.artifacts);
+  const problemText = asRecord(artifacts.problem_text);
+  const rewrites = asRows(artifacts.rewrites);
+  const rows = [
+    artifactRow("Problem text", problemText.status, "", problemText.updated_at, problemText.error)
+  ].concat(
+    rewrites.map((rewrite) =>
+      artifactRow(
+        `Rewrite ${shortKey(rewrite.key)}`,
+        rewrite.status,
+        embeddingSummary(asRows(rewrite.embeddings)),
+        rewrite.updated_at,
+        rewrite.error
+      )
+    )
+  );
+  return `
+    <div class="admin-detail-block">
+      <h3>Artifacts</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table admin-artifacts">
+          <thead>
+            <tr>
+              <th>Artifact</th>
+              <th>Status</th>
+              <th>Embeddings</th>
+              <th>Updated</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>${rows.join("")}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function artifactRow(
+  name: string,
+  status: unknown,
+  embeddings: string,
+  updatedAt: unknown,
+  error: unknown
+): string {
+  return `
+    <tr>
+      <td>${name}</td>
+      <td>${statusBadge(String(status || "unknown"))}</td>
+      <td>${embeddings || `<span class="admin-muted">None</span>`}</td>
+      <td>${shortDate(updatedAt, true)}</td>
+      <td>${error ? `<span class="admin-error-text">${escapeHtml(String(error))}</span>` : ""}</td>
+    </tr>`;
+}
+
+function embeddingSummary(embeddings: Row[]): string {
+  if (!embeddings.length) return `<span class="admin-muted">None</span>`;
+  const counts = embeddings.reduce<Record<string, number>>((acc, embedding) => {
+    const status = String(embedding.status || "unknown");
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const summary = Object.entries(counts)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([status, count]) => `${status}: ${count}`)
+    .join(", ");
+  const views = embeddings
+    .map(
+      (embedding) =>
+        `<span class="admin-view-status ${escapeHtml(String(embedding.status || ""))}">
+          ${escapeHtml(String(embedding.role || ""))}
+        </span>`
+    )
+    .join("");
+  return `<div>${escapeHtml(summary)}</div><div class="admin-view-statuses">${views}</div>`;
+}
+
+function logBlock(title: string, logs: Row[]): string {
+  if (!logs.length) return "";
+  return `
+    <div class="admin-detail-block">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="admin-log">
+        ${logs.map(logLine).join("")}
+      </div>
+    </div>`;
+}
+
+function logLine(log: Row): string {
+  const level = String(log.level || "info");
+  const data = formatLogData(log.data);
+  return `
+    <div class="admin-log-line level-${escapeHtml(level)}">
+      <span>${shortDate(log.created_at, true)}</span>
+      <b>${escapeHtml(level)}</b>
+      <p>${escapeHtml(String(log.message || ""))}${data}</p>
+    </div>`;
+}
+
+function formatLogData(raw: unknown): string {
+  if (raw === null || raw === undefined || raw === "") return "";
+  const data = asRecord(raw);
+  const parts: string[] = [];
+  if (data.problem_key) {
+    parts.push(`<code>${escapeHtml(String(data.problem_key))}</code>`);
+  }
+  if (data.error) {
+    parts.push(`<span class="admin-error-text">${escapeHtml(String(data.error))}</span>`);
+  }
+  if (parts.length) return ` ${parts.join(" ")}`;
+  return ` <code>${escapeHtml(formatJson(raw))}</code>`;
+}
+
 function select(name: string, selected: string, options: [string, string][]): string {
   return `
     <select name="${escapeHtml(name)}">
@@ -896,7 +1017,7 @@ function shortKey(raw: unknown): string {
   return escapeHtml(text);
 }
 
-function shortDate(raw: unknown): string {
+function shortDate(raw: unknown, withSeconds = false): string {
   const text = String(raw || "");
   if (!text) return "";
   const date = new Date(text);
@@ -907,6 +1028,7 @@ function shortDate(raw: unknown): string {
   })}, ${date.toLocaleTimeString("en", {
     hour: "2-digit",
     minute: "2-digit",
+    second: withSeconds ? "2-digit" : undefined,
     hour12: false
   })}`;
   return `<span title="${escapeHtml(text)}">${escapeHtml(display)}</span>`;

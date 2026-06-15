@@ -1437,6 +1437,92 @@ button {
   margin-top: 12px;
 }
 
+.admin-muted {
+  color: var(--muted);
+}
+
+.admin-error-text {
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.admin-artifacts th,
+.admin-artifacts td {
+  vertical-align: top;
+}
+
+.admin-artifacts td:last-child {
+  min-width: 220px;
+}
+
+.admin-view-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.admin-view-status {
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.admin-view-status.succeeded {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.admin-view-status.failed {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.admin-log {
+  display: grid;
+  gap: 6px;
+}
+
+.admin-log-line {
+  display: grid;
+  grid-template-columns: 120px 64px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.admin-log-line span,
+.admin-log-line b {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.admin-log-line.level-error b {
+  color: #b3261e;
+}
+
+.admin-log-line.level-warning b {
+  color: #8a5a00;
+}
+
+.admin-log-line p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.admin-log-line code {
+  color: var(--muted);
+}
+
+.admin-log-line .admin-error-text {
+  display: block;
+  margin-top: 2px;
+}
+
 .admin-edit-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1459,6 +1545,20 @@ button {
 .admin-edit-form input {
   width: 100%;
   padding: 0 10px;
+}
+
+.admin-problem-form {
+  margin-top: 14px;
+}
+
+.admin-problem-form label:has(textarea) {
+  grid-column: 1 / -1;
+}
+
+.admin-problem-form textarea {
+  width: 100%;
+  min-height: 280px;
+  resize: vertical;
 }
 
 .admin-settings-grid {
@@ -1587,5 +1687,13 @@ button {
 
   .admin-grid {
     grid-template-columns: 1fr;
+  }
+
+  .admin-log-line {
+    grid-template-columns: 1fr auto;
+  }
+
+  .admin-log-line p {
+    grid-column: 1 / -1;
   }
 }

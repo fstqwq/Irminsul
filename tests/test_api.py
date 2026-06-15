@@ -370,8 +370,8 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
             )
             conn.execute(
                 """
-                INSERT INTO artifacts(key, kind, text, status, attempts, updated_at)
-                VALUES (?, 'problem_text', ?, 'succeeded', 0, ?)
+                INSERT INTO artifacts(key, kind, text, status, updated_at)
+                VALUES (?, 'problem_text', ?, 'succeeded', ?)
                 """,
                 (problem_text_key, problem_text, utc_now()),
             )

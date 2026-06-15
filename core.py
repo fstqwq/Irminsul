@@ -17,7 +17,7 @@ from typing import Any, Iterator
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
 DEFAULT_CONFIG_PATH = SRC_DIR / "config.toml"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -60,8 +60,6 @@ class LimitsConfig:
 @dataclass(frozen=True)
 class JobsConfig:
     poll_seconds: int
-    rewrite_max_attempts: int
-    embedding_max_attempts: int
     embedding_batch_size: int
 
 
@@ -188,8 +186,6 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
         ),
         jobs=JobsConfig(
             poll_seconds=int(jobs.get("poll_seconds", 2)),
-            rewrite_max_attempts=int(jobs.get("rewrite_max_attempts", 3)),
-            embedding_max_attempts=int(jobs.get("embedding_max_attempts", 3)),
             embedding_batch_size=int(jobs.get("embedding_batch_size", 16)),
         ),
         search=SearchConfig(
@@ -351,6 +347,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version == 0:
         _migrate_0_to_1(conn)
         version = 1
+    if version == 1:
+        _migrate_1_to_2(conn)
+        version = 2
     if version != SCHEMA_VERSION:
         raise RuntimeError(f"Unsupported database schema version: {version}")
 
@@ -461,6 +460,27 @@ def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
             CREATE INDEX idx_audits_time ON search_audits(started_at);
 
             PRAGMA user_version=1;
+            """
+        )
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("ALTER TABLE artifacts DROP COLUMN attempts")
+        conn.executescript(
+            """
+            CREATE TABLE job_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_key TEXT NOT NULL REFERENCES jobs(key) ON DELETE CASCADE,
+              level TEXT NOT NULL CHECK(level IN ('info','warning','error')),
+              message TEXT NOT NULL,
+              data TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX idx_job_logs_job ON job_logs(job_key, id);
+
+            PRAGMA user_version=2;
             """
         )
 

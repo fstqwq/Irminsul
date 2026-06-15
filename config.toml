@@ -15,8 +15,6 @@ field_max_text_chars = 200000
 
 [jobs]
 poll_seconds = 2
-rewrite_max_attempts = 3
-embedding_max_attempts = 3
 embedding_batch_size = 16
 
 [api]

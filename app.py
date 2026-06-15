@@ -42,6 +42,7 @@ from pipeline import (
     list_jobs,
     list_import_jobs,
     list_indexes,
+    list_job_logs,
     list_problems,
     list_sources,
     patch_problem,
@@ -256,6 +257,49 @@ def _decode_job(job: dict[str, Any]) -> dict[str, Any]:
             except ValueError:
                 decoded[key] = value
     return decoded
+
+
+def _decode_job_log(row: dict[str, Any]) -> dict[str, Any]:
+    decoded = dict(row)
+    value = decoded.get("data")
+    if isinstance(value, str) and value:
+        try:
+            decoded["data"] = json.loads(value)
+        except ValueError:
+            decoded["data"] = value
+    return decoded
+
+
+def _fallback_job_logs(job: dict[str, Any]) -> list[dict[str, Any]]:
+    result = job.get("result")
+    if not isinstance(result, dict):
+        return []
+    logs: list[dict[str, Any]] = []
+    if result.get("canceled"):
+        logs.append(
+            {
+                "id": 0,
+                "job_key": job.get("key"),
+                "level": "warning",
+                "message": "Job canceled",
+                "data": None,
+                "created_at": job.get("updated_at"),
+            }
+        )
+    failures = result.get("failures")
+    if isinstance(failures, list):
+        for index, failure in enumerate(failures[:500], start=1):
+            logs.append(
+                {
+                    "id": index,
+                    "job_key": job.get("key"),
+                    "level": "error",
+                    "message": "Artifact generation failed",
+                    "data": failure,
+                    "created_at": job.get("updated_at"),
+                }
+            )
+    return logs
 
 
 def _decode_index(index: dict[str, Any]) -> dict[str, Any]:
@@ -547,7 +591,10 @@ def create_app() -> FastAPI:
         job = get_job(settings(), job_key)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
-        return _decode_job(job)
+        decoded = _decode_job(job)
+        logs = [_decode_job_log(row) for row in list_job_logs(settings(), job_key)]
+        decoded["logs"] = logs or _fallback_job_logs(decoded)
+        return decoded
 
     @app.post("/admin/api/jobs/{job_key}/retry")
     def job_retry(

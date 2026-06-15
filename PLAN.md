@@ -86,7 +86,7 @@ CREATE TABLE artifacts (
   method_key TEXT, role TEXT,
   text TEXT, data TEXT, blob BLOB,
   status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed')),
-  attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+  error TEXT,
   updated_at TEXT NOT NULL,
   UNIQUE(kind, parent_key, method_key, role)
 );
@@ -206,7 +206,7 @@ CREATE TABLE kv (
 
 **embedding 批量**：收集 pending embedding artifacts → 按 `embedding_batch_size=16` 分批 → 标记 running → 事务外调 `embed_texts()` → L2 normalize → 逐条短事务写回 succeeded。
 
-**失败处理**：单个 artifact 失败不影响其他。`attempts < max_attempts` 时可重试。
+**失败处理**：单个 artifact 失败不影响其他；artifact 不记录重试次数。失败后由管理员在 job 层手动 retry。
 
 ### 3.3 索引构建
 
@@ -447,8 +447,6 @@ field_max_text_chars = 200000
 
 [jobs]
 poll_seconds = 2
-rewrite_max_attempts = 3
-embedding_max_attempts = 3
 embedding_batch_size = 16
 
 [search]

@@ -46,9 +46,9 @@ def test_rewrite_and_embedding_artifacts_are_reused(monkeypatch, tmp_path: Path)
             conn.execute(
                 """
                 INSERT INTO artifacts(
-                  key, kind, text, status, attempts, updated_at
+                  key, kind, text, status, updated_at
                 )
-                VALUES (?, 'problem_text', ?, 'succeeded', 0, ?)
+                VALUES (?, 'problem_text', ?, 'succeeded', ?)
                 """,
                 (problem_text_key, problem_text, utc_now()),
             )
@@ -121,8 +121,8 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
             )
             conn.execute(
                 """
-                INSERT INTO artifacts(key, kind, text, status, attempts, updated_at)
-                VALUES (?, 'problem_text', ?, 'succeeded', 0, ?)
+                INSERT INTO artifacts(key, kind, text, status, updated_at)
+                VALUES (?, 'problem_text', ?, 'succeeded', ?)
                 """,
                 (problem_text_key, problem_text, utc_now()),
             )
