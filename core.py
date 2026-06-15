@@ -7,11 +7,12 @@ import os
 import secrets
 import sqlite3
 import tomllib
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -487,3 +488,497 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
+
+
+def get_job(settings: Settings, job_key: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE key = ?", (job_key,)).fetchone()
+        return row_to_dict(row) if row else None
+
+
+def list_import_jobs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE type = 'import'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_indexes(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM indexes
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_index(settings: Settings, selected_index_key: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute("SELECT * FROM indexes WHERE key = ?", (selected_index_key,)).fetchone()
+        return row_to_dict(row) if row else None
+
+
+def list_problems(
+    settings: Settings,
+    source_key: str | None = None,
+    enabled: bool | None = None,
+    deleted: bool | None = None,
+    q: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    if source_key:
+        where.append("source_key = ?")
+        params.append(source_key)
+    if enabled is not None:
+        where.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    if deleted is not None:
+        where.append("deleted = ?")
+        params.append(1 if deleted else 0)
+    if q.strip():
+        where.append("(key LIKE ? OR title LIKE ? OR url LIKE ?)")
+        needle = f"%{q.strip()}%"
+        params.extend([needle, needle, needle])
+
+    where_sql = " AND ".join(where)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    with db_connection(settings) as conn:
+        total = conn.execute(
+            f"SELECT count(*) FROM problems WHERE {where_sql}",
+            params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT key, source_key, title, url, text_key, enabled, deleted, updated_at
+            FROM problems
+            WHERE {where_sql}
+            ORDER BY updated_at DESC, key
+            LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+    return {"total": total, "items": [row_to_dict(row) for row in rows]}
+
+
+def get_problem(settings: Settings, problem_key: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT
+              p.key, p.source_key, p.title, p.url, p.text_key,
+              p.enabled, p.deleted, p.updated_at,
+              a.text,
+              a.status AS text_status,
+              a.error AS text_error,
+              a.updated_at AS text_updated_at
+            FROM problems p
+            JOIN artifacts a ON a.key = p.text_key AND a.kind = 'problem_text'
+            WHERE p.key = ?
+            """,
+            (problem_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        problem = row_to_dict(row)
+        rewrites = [
+            row_to_dict(rewrite)
+            for rewrite in conn.execute(
+                """
+                SELECT key, method_key, status, error, updated_at
+                FROM artifacts
+                WHERE kind = 'rewrite'
+                  AND parent_key = ?
+                ORDER BY updated_at DESC, key
+                """,
+                (problem["text_key"],),
+            ).fetchall()
+        ]
+        for rewrite in rewrites:
+            embeddings = [
+                row_to_dict(embedding)
+                for embedding in conn.execute(
+                    """
+                    SELECT key, method_key, role, status, error, updated_at
+                    FROM artifacts
+                    WHERE kind = 'embedding'
+                      AND parent_key = ?
+                    ORDER BY role
+                    """,
+                    (rewrite["key"],),
+                ).fetchall()
+            ]
+            rewrite["embeddings"] = embeddings
+        problem["artifacts"] = {
+            "problem_text": {
+                "key": problem["text_key"],
+                "status": problem["text_status"],
+                "error": problem["text_error"],
+                "updated_at": problem["text_updated_at"],
+            },
+            "rewrites": rewrites,
+        }
+    return problem
+
+
+def patch_problem(settings: Settings, problem_key: str, changes: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"title", "url", "enabled", "deleted"}
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in changes.items():
+        if key not in allowed or value is None:
+            continue
+        assignments.append(f"{key} = ?")
+        params.append(int(value) if key in {"enabled", "deleted"} else str(value))
+    if not assignments:
+        raise ValueError("no valid problem changes")
+    assignments.append("updated_at = ?")
+    params.extend([utc_now(), problem_key])
+    with db_connection(settings) as conn:
+        with conn:
+            cursor = conn.execute(
+                f"UPDATE problems SET {', '.join(assignments)} WHERE key = ?",
+                params,
+            )
+        if cursor.rowcount == 0:
+            raise ValueError("problem not found")
+        row = conn.execute("SELECT * FROM problems WHERE key = ?", (problem_key,)).fetchone()
+    return row_to_dict(row)
+
+
+def batch_update_problems(settings: Settings, keys: list[str], action: str) -> dict[str, Any]:
+    if not keys:
+        raise ValueError("keys are required")
+    if action not in {"enable", "disable", "delete", "restore"}:
+        raise ValueError("invalid batch action")
+    if action == "enable":
+        assignments = "enabled = 1"
+    elif action == "disable":
+        assignments = "enabled = 0"
+    elif action == "delete":
+        assignments = "deleted = 1"
+    else:
+        assignments = "deleted = 0"
+
+    placeholders = ",".join("?" for _ in keys)
+    with db_connection(settings) as conn:
+        with conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE problems
+                SET {assignments}, updated_at = ?
+                WHERE key IN ({placeholders})
+                """,
+                [utc_now(), *keys],
+            )
+    return {"updated": cursor.rowcount}
+
+
+def list_sources(settings: Settings) -> list[dict[str, Any]]:
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              s.key, s.name, s.enabled, s.updated_at,
+              count(p.key) AS problem_count,
+              sum(CASE WHEN p.enabled = 1 AND p.deleted = 0 THEN 1 ELSE 0 END) AS enabled_problem_count,
+              sum(CASE WHEN p.deleted = 1 THEN 1 ELSE 0 END) AS deleted_count
+            FROM sources s
+            LEFT JOIN problems p ON p.source_key = s.key
+            GROUP BY s.key, s.name, s.enabled, s.updated_at
+            ORDER BY s.key
+            """
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def patch_source(settings: Settings, source_key: str, changes: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"name", "enabled"}
+    assignments: list[str] = []
+    params: list[Any] = []
+    for key, value in changes.items():
+        if key not in allowed or value is None:
+            continue
+        assignments.append(f"{key} = ?")
+        params.append(int(value) if key == "enabled" else str(value))
+    if not assignments:
+        raise ValueError("no valid source changes")
+    assignments.append("updated_at = ?")
+    params.extend([utc_now(), source_key])
+    with db_connection(settings) as conn:
+        with conn:
+            cursor = conn.execute(
+                f"UPDATE sources SET {', '.join(assignments)} WHERE key = ?",
+                params,
+            )
+        if cursor.rowcount == 0:
+            raise ValueError("source not found")
+        row = conn.execute("SELECT * FROM sources WHERE key = ?", (source_key,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_jobs(
+    settings: Settings,
+    job_type: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    if job_type:
+        where.append("type = ?")
+        params.append(job_type)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    limit = max(1, min(limit, 500))
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def append_job_log(
+    settings: Settings,
+    job_key: str,
+    level: Literal["info", "warning", "error"],
+    message: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO job_logs(job_key, level, message, data, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job_key, level, message, json_dumps(data) if data is not None else None, utc_now()),
+            )
+
+
+def list_job_logs(settings: Settings, job_key: str, limit: int = 500) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 2000))
+    with db_connection(settings) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM job_logs
+            WHERE job_key = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (job_key, limit),
+        ).fetchall()
+    return list(reversed([row_to_dict(row) for row in rows]))
+
+
+def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("job not found")
+    if job["status"] not in {"blocked", "failed"}:
+        raise ValueError("job is not retryable")
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued', progress = ?, result = NULL, error = NULL, updated_at = ?
+                WHERE key = ?
+                """,
+                (json_dumps({"phase": "queued"}), utc_now(), job_key),
+            )
+    append_job_log(settings, job_key, "info", "Job queued for retry")
+    return get_job(settings, job_key) or job
+
+
+def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("job not found")
+    if job["status"] in {"succeeded", "blocked", "failed"}:
+        raise ValueError("job is not running or queued")
+
+    progress = job_progress(job)
+    progress["cancel_requested"] = True
+    progress.setdefault("phase", "canceling")
+    result = job_result(job)
+    result["canceled"] = True
+    now = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            if job["status"] in {"draft", "queued"}:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed', progress = ?, result = ?, error = ?, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        json_dumps(progress),
+                        json_dumps(result),
+                        "Canceled by admin",
+                        now,
+                        job_key,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET progress = ?, result = ?, updated_at = ?
+                    WHERE key = ? AND status = 'running'
+                    """,
+                    (json_dumps(progress), json_dumps(result), now, job_key),
+                )
+    append_job_log(settings, job_key, "warning", "Cancellation requested")
+    updated = get_job(settings, job_key)
+    if updated is None:
+        raise ValueError("job not found after cancel")
+    return updated
+
+
+def create_cleanup_job(settings: Settings) -> dict[str, Any]:
+    job_key = "j:" + uuid.uuid4().hex
+    now = utc_now()
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                VALUES (?, 'cleanup', 'queued', ?, ?, ?, ?)
+                """,
+                (job_key, json_dumps({}), json_dumps({"phase": "queued"}), now, now),
+            )
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("cleanup job was not created")
+    return job
+
+
+def mark_job_failed(settings: Settings, job_key: str, error: str) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE key = ? AND status IN ('queued', 'running')
+                """,
+                (error[:4000], utc_now(), job_key),
+            )
+
+
+def job_progress(job: dict[str, Any]) -> dict[str, Any]:
+    raw = job.get("progress")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            return {}
+    return {}
+
+
+def job_result(job: dict[str, Any]) -> dict[str, Any]:
+    raw = job.get("result")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            return {}
+    return {}
+
+
+def cancel_requested(settings: Settings, job_key: str) -> bool:
+    job = get_job(settings, job_key)
+    return bool(job and job_progress(job).get("cancel_requested"))
+
+
+def finish_if_cancel_requested(
+    settings: Settings,
+    job_key: str,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not cancel_requested(settings, job_key):
+        return None
+    payload = dict(result or {})
+    payload["canceled"] = True
+    append_job_log(settings, job_key, "warning", "Job canceled")
+    return finish_job(settings, job_key, "failed", payload, "Canceled by admin")
+
+
+def update_job_progress(
+    settings: Settings,
+    job_key: str,
+    progress: dict[str, Any],
+    result: dict[str, Any] | None = None,
+) -> None:
+    with db_connection(settings) as conn:
+        with conn:
+            row = conn.execute("SELECT progress FROM jobs WHERE key = ?", (job_key,)).fetchone()
+            if row is not None:
+                current_progress = job_progress(row_to_dict(row))
+                if current_progress.get("cancel_requested") and not progress.get("cancel_requested"):
+                    progress = dict(progress)
+                    progress["cancel_requested"] = True
+            if result is None:
+                conn.execute(
+                    "UPDATE jobs SET progress = ?, updated_at = ? WHERE key = ?",
+                    (json_dumps(progress), utc_now(), job_key),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET progress = ?, result = ?, updated_at = ? WHERE key = ?",
+                    (json_dumps(progress), json_dumps(result), utc_now(), job_key),
+                )
+
+
+def finish_job(
+    settings: Settings,
+    job_key: str,
+    status: Literal["succeeded", "blocked", "failed"],
+    result: dict[str, Any],
+    error: str | None,
+) -> dict[str, Any]:
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, result = ?, error = ?, updated_at = ?
+                WHERE key = ?
+                """,
+                (status, json_dumps(result), error, utc_now(), job_key),
+            )
+    job = get_job(settings, job_key)
+    if job is None:
+        raise ValueError("job not found after finish")
+    return job

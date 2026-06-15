@@ -10,10 +10,9 @@ from pathlib import Path
 
 import numpy as np
 
-from core import db_connection, ensure_database, get_settings, text_key, utc_now
+from core import create_cleanup_job, db_connection, ensure_database, get_settings, text_key, utc_now
 from pipeline import (
     create_build_index_job,
-    create_cleanup_job,
     ensure_embedding_artifacts,
     ensure_rewrite_artifact,
     execute_build_index_job,
