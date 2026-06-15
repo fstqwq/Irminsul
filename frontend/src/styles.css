@@ -1220,9 +1220,14 @@ button {
   line-height: 22px;
 }
 
+.admin-dashboard {
+  display: grid;
+  gap: 16px;
+}
+
 .admin-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
 }
 
@@ -1259,6 +1264,10 @@ button {
   padding: 12px;
 }
 
+.admin-dashboard .admin-panel {
+  margin-bottom: 0;
+}
+
 .admin-panel h2,
 .admin-detail h2,
 .admin-detail h3 {
@@ -1283,6 +1292,7 @@ button {
 .admin-inline-form input,
 .admin-inline-form select,
 .admin-edit-form input,
+.admin-edit-form textarea,
 .admin-login input {
   min-height: 34px;
   border: 1px solid var(--line);
@@ -1415,6 +1425,22 @@ button {
   min-width: 220px;
 }
 
+.admin-failures {
+  min-width: 680px;
+}
+
+.admin-failures td {
+  vertical-align: top;
+}
+
+.admin-failures td:first-child {
+  width: 220px;
+}
+
+.admin-failures td:nth-child(2) {
+  width: 100px;
+}
+
 .admin-view-statuses {
   display: flex;
   flex-wrap: wrap;
@@ -1505,6 +1531,13 @@ button {
 .admin-edit-form input {
   width: 100%;
   padding: 0 10px;
+}
+
+.admin-edit-form textarea {
+  padding: 10px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 22px;
 }
 
 .admin-problem-form {

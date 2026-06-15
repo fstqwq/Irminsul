@@ -143,7 +143,7 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         assert rewrite_event["abstract"] == "rewritten abstract"
         assert rewrite_event["abstract_zh"] == "rewritten abstract zh"
         candidate = events[-2]["candidates"][0]
-        assert events[-2]["cost"]["microusd"] == 45
+        assert events[-2]["cost"]["microusd"] == 70
         assert candidate["title"] == "Sample"
         assert candidate["clean"] == "original"
         assert candidate["statement"] == "statement"
@@ -176,9 +176,10 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
 
     assert audit["query"] == "hello"
     assert json.loads(audit["result"])["top"][0]["title"] == "Sample"
-    assert json.loads(audit["cost"])["microusd"] == 45
+    assert json.loads(audit["cost"])["microusd"] == 70
     rewrite_call = json.loads(audit["api_calls"])[0]
-    assert rewrite_call["pricing"]["input_price_per_1m_tokens_microusd"] == 90000
+    assert rewrite_call["provider"] == "deepseek"
+    assert rewrite_call["pricing"]["input_price_per_1m_tokens_microusd"] == 100000
 
 
 def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch, tmp_path: Path) -> None:
@@ -313,8 +314,16 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         )
         assert dry_run.status_code == 200
         payload = dry_run.json()
+        assert payload["filename"] == "problems.jsonl"
         assert payload["stats"]["new"] == 1
         assert payload["stats"]["errors"] == []
+
+        draft_detail = client.get(f"/admin/api/imports/{payload['job_key']}")
+        assert draft_detail.status_code == 200
+        assert draft_detail.json()["payload"]["filename"] == "problems.jsonl"
+        draft_list = client.get("/admin/api/imports")
+        assert draft_list.status_code == 200
+        assert draft_list.json()["items"][0]["payload"]["filename"] == "problems.jsonl"
 
         confirm = client.post(
             f"/admin/api/import/{payload['job_key']}/confirm",
@@ -324,6 +333,35 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         job = wait_for_job(client, payload["job_key"])
         assert job["status"] == "succeeded"
         assert job["result"]["new"] == 1
+
+        delete_completed = client.delete(
+            f"/admin/api/import/{payload['job_key']}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert delete_completed.status_code == 400
+
+        delete_dry_run = client.post(
+            "/admin/api/import/dry-run",
+            data={"mode": "upsert"},
+            files={"file": ("delete-me.jsonl", line.encode("utf-8"), "application/jsonl")},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert delete_dry_run.status_code == 200
+        delete_key = delete_dry_run.json()["job_key"]
+        delete_detail = client.get(f"/admin/api/imports/{delete_key}")
+        assert delete_detail.status_code == 200
+        assert delete_detail.json()["payload"]["filename"] == "delete-me.jsonl"
+        upload_path = Path(delete_detail.json()["payload"]["path"])
+        assert upload_path.exists()
+
+        delete_draft = client.delete(
+            f"/admin/api/import/{delete_key}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert delete_draft.status_code == 200
+        assert delete_draft.json()["deleted"]["status"] == "draft"
+        assert not upload_path.exists()
+        assert client.get(f"/admin/api/imports/{delete_key}").status_code == 404
 
         problems = client.get("/admin/api/problems")
         assert problems.status_code == 200
@@ -341,6 +379,23 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         )
         assert patched_problem.status_code == 200
         assert patched_problem.json()["title"] == "Updated Theatre Square"
+        old_text_key = patched_problem.json()["text_key"]
+
+        updated_text = "Calculate paving stones with a changed statement."
+        patched_text = client.patch(
+            "/admin/api/problems/CodeForces/1A",
+            json={"text": updated_text},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert patched_text.status_code == 200
+        assert patched_text.json()["text"] == updated_text
+        assert patched_text.json()["text_key"] == text_key(updated_text)
+        assert patched_text.json()["text_key"] != old_text_key
+        assert patched_text.json()["artifacts"]["problem_text"]["key"] == text_key(updated_text)
+
+        refreshed_problem = client.get("/admin/api/problems/CodeForces/1A")
+        assert refreshed_problem.status_code == 200
+        assert refreshed_problem.json()["text"] == updated_text
 
         sources = client.get("/admin/api/sources")
         assert sources.status_code == 200
@@ -517,7 +572,56 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
         assert activate.status_code == 200
         assert activate.json()["status"] == "active"
 
+        dashboard = client.get("/admin/api/dashboard")
+        assert dashboard.status_code == 200
+        dashboard_payload = dashboard.json()
+        assert dashboard_payload["problem_count"] == 1
+        assert dashboard_payload["rewrite_problem_count"] == 1
+        assert dashboard_payload["embedding_problem_count"] == 1
+        assert dashboard_payload["active_index_problem_count"] == 1
+        assert dashboard_payload["active_index_key"] == index_key
+
         health = client.get("/api/health")
         assert health.status_code == 200
         assert health.json()["loaded_index_key"] == index_key
         assert health.json()["problem_count"] == 1
+
+
+def test_startup_active_index_cache_failure_degrades(tmp_path: Path) -> None:
+    base_settings = get_settings()
+    storage = replace(
+        base_settings.storage,
+        db_path=tmp_path / "app.sqlite3",
+        upload_dir=tmp_path / "uploads",
+        index_cache_dir=tmp_path / "index_cache",
+    )
+    test_settings = with_admin_credentials(replace(base_settings, storage=storage), tmp_path)
+    ensure_database(test_settings)
+
+    index_key = "i:missing-cache"
+    with db_connection(test_settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO indexes(key, status, meta, created_at, activated_at)
+                VALUES (?, 'active', ?, ?, ?)
+                """,
+                (index_key, json.dumps({"problem_count": 1}), utc_now(), utc_now()),
+            )
+            conn.execute(
+                """
+                INSERT INTO kv(key, value, updated_at)
+                VALUES ('active_index_key', ?, ?)
+                """,
+                (index_key, utc_now()),
+            )
+
+    state = IndexState()
+    app_module._load_active_index(test_settings, state)
+
+    assert state.current is None
+    with db_connection(test_settings) as conn:
+        row = conn.execute("SELECT status, error FROM indexes WHERE key = ?", (index_key,)).fetchone()
+
+    assert row["status"] == "active"
+    assert "startup load failed" in row["error"]

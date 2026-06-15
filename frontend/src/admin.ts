@@ -113,7 +113,8 @@ const settingsKeyLabels: Record<string, string> = {
   model: "Model",
   identity: "Model identity",
   url: "Endpoint",
-  api_key_env: "API key environment variable"
+  api_key_env: "API key environment variable",
+  provider: "Provider routing"
 };
 
 const state: AdminState = {
@@ -357,26 +358,34 @@ function renderPage(): string {
 
 function renderDashboard(data: Row = {}): string {
   const currentJob = asRecord(data.current_job);
+  const activeIndexCount =
+    data.active_index_problem_count === null || data.active_index_problem_count === undefined
+      ? "None"
+      : data.active_index_problem_count;
   return `
-    <section class="admin-grid">
-      ${metric("Problems", data.problem_count)}
-      ${metric("Sources", data.source_count)}
-      ${metric("Active index", data.active_index_key || "None", "key")}
-      ${metric("Today searches", data.today_searches)}
-    </section>
-    <section class="admin-panel">
-      <h2>Current job</h2>
-      ${
-        Object.keys(currentJob).length
-          ? detailGrid([
-              ["Job ID", currentJob.key, "key"],
-              ["Type", currentJob.type, "jobType"],
-              ["Status", currentJob.status, "status"],
-              ["Updated", currentJob.updated_at, "date"]
-            ]) + htmlBlock("Progress", escapeHtml(formatProgress(currentJob.type, currentJob.progress)))
-          : `<div class="admin-empty">No queued or running job.</div>`
-      }
-    </section>`;
+    <div class="admin-dashboard">
+      <section class="admin-grid">
+        ${metric("Enabled problems", data.problem_count)}
+        ${metric("With rewrite", data.rewrite_problem_count)}
+        ${metric("With embedding", data.embedding_problem_count)}
+        ${metric("Active index problems", activeIndexCount)}
+        ${metric("Sources", data.source_count)}
+        ${metric("Today searches", data.today_searches)}
+      </section>
+      <section class="admin-panel">
+        <h2>Current job</h2>
+        ${
+          Object.keys(currentJob).length
+            ? detailGrid([
+                ["Job ID", currentJob.key, "key"],
+                ["Type", currentJob.type, "jobType"],
+                ["Status", currentJob.status, "status"],
+                ["Updated", currentJob.updated_at, "date"]
+              ]) + htmlBlock("Progress", escapeHtml(formatProgress(currentJob.type, currentJob.progress)))
+            : `<div class="admin-empty">No queued or running job.</div>`
+        }
+      </section>
+    </div>`;
 }
 
 function renderImports(data: Row = {}): string {
@@ -398,21 +407,23 @@ function renderImports(data: Row = {}): string {
       ${state.draftImport ? renderDraftImport(state.draftImport) : ""}
     </section>
     ${state.details.import ? renderImportDetail(state.details.import) : ""}
-    ${table(["Import ID", "Status", "Progress", "Updated", ""], items || emptyRow(5))}`;
+    ${table(["File", "Status", "Progress", "Updated", ""], items || emptyRow(5))}`;
 }
 
 function importRow(item: Row): string {
   const key = String(item.key || "");
   const status = String(item.status || "");
+  const filename = importFilename(item);
   return `
     <tr>
-      <td>${shortKey(key)}</td>
+      <td>${escapeHtml(filename)}</td>
       <td>${statusBadge(status)}</td>
       <td>${escapeHtml(formatProgress(item.type || "import", item.progress))}</td>
       <td>${shortDate(item.updated_at)}</td>
       <td class="admin-actions">
         <button data-import-detail="${escapeHtml(key)}" type="button">View</button>
         ${status === "draft" ? `<button data-confirm-import="${escapeHtml(key)}" type="button">Confirm</button>` : ""}
+        ${status === "draft" ? `<button data-delete-import="${escapeHtml(key)}" type="button">Delete</button>` : ""}
       </td>
     </tr>`;
 }
@@ -420,13 +431,16 @@ function importRow(item: Row): string {
 function renderDraftImport(draft: Row): string {
   const stats = asRecord(draft.stats);
   const errors = Array.isArray(stats.errors) ? stats.errors : [];
+  const key = String(draft.job_key || draft.key || "");
   return `
     <div class="admin-draft">
+      <span>${escapeHtml(importFilename(draft))}</span>
       <span>New: ${value(stats.new)}</span>
       <span>Updated: ${value(stats.overwrite)}</span>
       <span>Skipped: ${value(stats.skip)}</span>
       <span>Errors: ${errors.length}</span>
-      <button data-confirm-import="${escapeHtml(String(draft.job_key))}" type="button">Confirm</button>
+      <button data-confirm-import="${escapeHtml(key)}" type="button">Confirm</button>
+      <button data-delete-import="${escapeHtml(key)}" type="button">Delete</button>
     </div>
     ${errors.length ? jsonBlock("Errors", errors) : ""}`;
 }
@@ -435,6 +449,7 @@ function renderImportDetail(job: Row): string {
   return detailPanel(
     "Import detail",
     detailGrid([
+      ["File", importFilename(job)],
       ["Import ID", job.key, "key"],
       ["Status", job.status, "status"],
       ["Created", job.created_at, "date"],
@@ -524,14 +539,15 @@ function renderProblemEditor(problem: Row): string {
         <label>ID<input name="key" value="${escapeHtml(String(problem.key || ""))}" readonly></label>
         <label>Title<input name="title" value="${escapeHtml(String(problem.title || ""))}"></label>
         <label>URL<input name="url" value="${escapeHtml(String(problem.url || ""))}"></label>
+        <label>Text key<input value="${escapeHtml(String(problem.text_key || ""))}" readonly></label>
         <label><input name="enabled" type="checkbox" ${truthy(problem.enabled) ? "checked" : ""}> Enabled</label>
         <label><input name="deleted" type="checkbox" ${truthy(problem.deleted) ? "checked" : ""}> Deleted</label>
         <label>
-          Statement preview
-          <textarea readonly rows="16">${escapeHtml(String(problem.text || ""))}</textarea>
+          Problem text
+          <textarea name="text" rows="18" spellcheck="false">${escapeHtml(String(problem.text || ""))}</textarea>
         </label>
         <div class="admin-actions">
-          <button type="submit">Save metadata</button>
+          <button type="submit">Save problem</button>
           <button data-close-detail="problem" type="button">Cancel</button>
         </div>
       </form>`,
@@ -672,6 +688,7 @@ function renderJobDetail(job: Row): string {
       ["Progress", formatProgress(job.type, job.progress)]
     ]) +
       jsonBlock("Payload", job.payload) +
+      failureBlock(job) +
       logBlock("Result", asRows(job.logs)) +
       jsonBlock("Error", job.error) +
       (isActiveJobStatus(status)
@@ -763,7 +780,7 @@ function settingsSection(title: string, values: Row): string {
       ([key, raw]) => `
       <tr>
         <th>${escapeHtml(label(settingsKeyLabels, key))}</th>
-        <td>${escapeHtml(String(raw ?? ""))}</td>
+        <td>${escapeHtml(settingsValue(raw))}</td>
       </tr>`
     )
     .join("");
@@ -772,6 +789,12 @@ function settingsSection(title: string, values: Row): string {
       <h2>${escapeHtml(title)}</h2>
       <table class="admin-kv"><tbody>${rows || emptyRow(2)}</tbody></table>
     </section>`;
+}
+
+function settingsValue(raw: unknown): string {
+  if (raw === null || raw === undefined) return "";
+  if (typeof raw === "object") return formatJson(raw);
+  return String(raw);
 }
 
 type DisplayKind = "text" | "key" | "date" | "status" | "jobType" | "cost";
@@ -836,6 +859,71 @@ function jsonBlock(title: string, raw: unknown): string {
       <h3>${escapeHtml(title)}</h3>
       <pre class="admin-json">${escapeHtml(formatJson(raw))}</pre>
     </div>`;
+}
+
+function failureBlock(job: Row): string {
+  const failures = jobFailures(job);
+  if (!failures.length) return "";
+  const rows = failures
+    .map(
+      (failure) => `
+      <tr>
+        <td><code>${escapeHtml(failure.problemKey)}</code></td>
+        <td>${escapeHtml(failure.phase)}</td>
+        <td><span class="admin-error-text">${escapeHtml(failure.error)}</span></td>
+      </tr>`
+    )
+    .join("");
+  return `
+    <div class="admin-detail-block">
+      <h3>Failures (${failures.length})</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table admin-failures">
+          <thead>
+            <tr>
+              <th>Problem</th>
+              <th>Phase</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function jobFailures(job: Row): { problemKey: string; phase: string; error: string }[] {
+  const result = asRecord(parseMaybeJson(job.result));
+  const failures = asRows(result.failures);
+  if (failures.length) {
+    return failures
+      .map((failure) => ({
+        problemKey: String(failure.problem_key || ""),
+        phase: String(failure.phase || ""),
+        error: String(failure.error || "")
+      }))
+      .filter((failure) => failure.problemKey || failure.error);
+  }
+
+  return asRows(job.logs).flatMap((log) => {
+    const data = asRecord(log.data);
+    const keys = Array.isArray(data.problem_keys)
+      ? data.problem_keys.map((key) => String(key))
+      : data.problem_key
+        ? [String(data.problem_key)]
+        : [];
+    const phase = String(data.phase || phaseFromMessage(log.message));
+    const error = String(data.error || log.message || "");
+    return keys.map((problemKey) => ({ problemKey, phase, error }));
+  });
+}
+
+function phaseFromMessage(raw: unknown): string {
+  const message = String(raw || "").toLowerCase();
+  if (message.includes("rewrite")) return "rewrite";
+  if (message.includes("embedding")) return "embedding";
+  if (message.includes("import")) return "import";
+  return "";
 }
 
 function artifactStatusBlock(problem: Row): string {
@@ -1017,6 +1105,19 @@ function shortKey(raw: unknown): string {
   return escapeHtml(text);
 }
 
+function importFilename(item: Row): string {
+  const payload = asRecord(parseMaybeJson(item.payload));
+  const filename = String(item.filename || payload.filename || "");
+  if (filename) return filename;
+  const path = String(payload.path || "");
+  return fileNameFromPath(path) || String(item.key || "");
+}
+
+function fileNameFromPath(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
 function shortDate(raw: unknown, withSeconds = false): string {
   const text = String(raw || "");
   if (!text) return "";
@@ -1194,6 +1295,25 @@ function bindImports(): void {
     });
   });
 
+  rootEl.querySelectorAll<HTMLButtonElement>("[data-delete-import]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.deleteImport || "";
+      if (!window.confirm("Delete this draft import?")) return;
+      void api(`/admin/api/import/${encodeURIComponent(key)}`, { method: "DELETE" })
+        .then(() => {
+          if (String(state.draftImport?.job_key || state.draftImport?.key || "") === key) {
+            state.draftImport = null;
+          }
+          if (String(state.details.import?.key || "") === key) {
+            state.details.import = null;
+          }
+          state.notice = "Draft import deleted.";
+          return loadPage();
+        })
+        .catch(showError);
+    });
+  });
+
   rootEl.querySelectorAll<HTMLButtonElement>("[data-import-detail]").forEach((button) => {
     button.addEventListener("click", () => {
       const key = button.dataset.importDetail || "";
@@ -1262,20 +1382,25 @@ function bindProblems(): void {
     const body = {
       title: String(form.get("title") || ""),
       url: String(form.get("url") || ""),
+      text: String(form.get("text") || ""),
       enabled: form.get("enabled") === "on",
       deleted: form.get("deleted") === "on"
     };
-    state.details.problem = null;
-    void patchProblem(key, body);
+    void patchProblem(key, body, { keepDetail: true });
   });
 }
 
-async function patchProblem(key: string, body: Row): Promise<void> {
-  await api(`/admin/api/problems/${pathKey(key)}`, {
+async function patchProblem(
+  key: string,
+  body: Row,
+  options: { keepDetail?: boolean } = {}
+): Promise<void> {
+  const updated = await api<Row>(`/admin/api/problems/${pathKey(key)}`, {
     method: "PATCH",
     body: JSON.stringify(body)
   });
   state.notice = "Problem updated.";
+  if (options.keepDetail) state.details.problem = updated;
   await loadPage();
 }
 

@@ -6,7 +6,7 @@ import uuid
 import shutil
 import gc
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +21,8 @@ from core import (
     cancel_requested as _cancel_requested,
     canonical_text,
     db_connection,
+    db_read_connection,
+    db_write_connection,
     embedding_key,
     finish_if_cancel_requested as _finish_if_cancel_requested,
     finish_job as _finish_job,
@@ -66,7 +68,7 @@ class JobWorker:
 
 
 def recover_startup(settings: Settings) -> None:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         running_jobs = conn.execute("SELECT * FROM jobs WHERE status = 'running'").fetchall()
         with conn:
             for row in running_jobs:
@@ -97,7 +99,7 @@ def recover_startup(settings: Settings) -> None:
 
 
 def run_next_job(settings: Settings) -> bool:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute(
             """
             SELECT * FROM jobs
@@ -201,6 +203,8 @@ def _model_snapshot(settings: Settings, kind: Literal["rewrite", "embedding"]) -
         "url": model.url,
         "api_key_env": model.api_key_env,
     }
+    if model.provider:
+        snapshot["provider"] = model.provider
     if kind == "rewrite":
         snapshot["prompt"] = REWRITE_PROMPT
         snapshot["views"] = list(VIEWS)
@@ -263,7 +267,12 @@ def _validate_import_mode(mode: str) -> ImportMode:
     return mode  # type: ignore[return-value]
 
 
-def create_import_dry_run(path: Path, mode: str, settings: Settings) -> dict[str, Any]:
+def create_import_dry_run(
+    path: Path,
+    mode: str,
+    settings: Settings,
+    filename: str | None = None,
+) -> dict[str, Any]:
     import_mode = _validate_import_mode(mode)
     rows, errors = read_import_jsonl(path, settings)
     stats = ImportStats(total=len(rows), errors=errors)
@@ -271,7 +280,7 @@ def create_import_dry_run(path: Path, mode: str, settings: Settings) -> dict[str
     if import_mode == "sync_source" and len(source_keys) != 1:
         stats.errors.append({"line": 0, "error": "sync_source requires exactly one source"})
 
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         existing_keys = {
             row["key"]
             for row in conn.execute(
@@ -315,6 +324,7 @@ def create_import_dry_run(path: Path, mode: str, settings: Settings) -> dict[str
                     json_dumps(
                         {
                             "path": str(path),
+                            "filename": filename or path.name,
                             "mode": import_mode,
                             "file_sha256": file_sha256(path),
                             "file_size": path.stat().st_size,
@@ -328,11 +338,43 @@ def create_import_dry_run(path: Path, mode: str, settings: Settings) -> dict[str
                 ),
             )
 
-    return {"job_key": job_key, "stats": stat_result}
+    return {"job_key": job_key, "filename": filename or path.name, "stats": stat_result}
+
+
+def delete_import_draft(job_key: str, settings: Settings) -> dict[str, Any]:
+    upload_path: Path | None = None
+    with db_write_connection(settings) as conn:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE key = ? AND type = 'import'",
+            (job_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("import job not found")
+        job = row_to_dict(row)
+        if job["status"] != "draft":
+            raise ValueError("only draft import jobs can be deleted")
+
+        try:
+            payload = json.loads(job["payload"] or "{}")
+            raw_path = payload.get("path")
+            if raw_path:
+                upload_path = _ensure_inside(settings.storage.upload_dir, Path(str(raw_path)))
+        except Exception:
+            upload_path = None
+
+        with conn:
+            conn.execute("DELETE FROM jobs WHERE key = ?", (job_key,))
+
+    if upload_path is not None:
+        try:
+            _remove_file_inside(settings.storage.upload_dir, upload_path)
+        except OSError:
+            pass
+    return job
 
 
 def confirm_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         row = conn.execute(
             "SELECT * FROM jobs WHERE key = ? AND type = 'import'",
             (job_key,),
@@ -390,7 +432,8 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
         path = Path(payload["path"])
         mode = _validate_import_mode(str(payload["mode"]))
 
-        now = utc_now()
+    now = utc_now()
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -517,14 +560,24 @@ def ensure_rewrite_artifact(
     selected_method_key = selected_method_key or rewrite_method_key(settings)
     selected_rewrite_key = rewrite_key(problem_text_key, selected_method_key)
 
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         source = conn.execute(
             "SELECT text FROM artifacts WHERE key = ? AND kind = 'problem_text'",
             (problem_text_key,),
         ).fetchone()
         if source is None:
             raise ValueError("problem text artifact not found")
+        existing = conn.execute(
+            """
+            SELECT * FROM artifacts
+            WHERE key = ? AND kind = 'rewrite' AND status = 'succeeded'
+            """,
+            (selected_rewrite_key,),
+        ).fetchone()
+        if existing is not None:
+            return row_to_dict(existing)
 
+    with db_write_connection(settings) as conn:
         now = utc_now()
         with conn:
             conn.execute(
@@ -538,13 +591,11 @@ def ensure_rewrite_artifact(
                 """,
                 (selected_rewrite_key, problem_text_key, selected_method_key, now),
             )
-        artifact = row_to_dict(
-            conn.execute("SELECT * FROM artifacts WHERE key = ?", (selected_rewrite_key,)).fetchone()
-        )
-        if artifact["status"] == "succeeded":
-            return artifact
-
-        with conn:
+            artifact = row_to_dict(
+                conn.execute("SELECT * FROM artifacts WHERE key = ?", (selected_rewrite_key,)).fetchone()
+            )
+            if artifact["status"] == "succeeded":
+                return artifact
             conn.execute(
                 """
                 UPDATE artifacts
@@ -561,7 +612,7 @@ def ensure_rewrite_artifact(
             timeout=settings.request_timeout,
         )
         payload = _rewrite_payload(rewrite, settings)
-        with db_connection(settings) as conn:
+        with db_write_connection(settings) as conn:
             with conn:
                 conn.execute(
                     """
@@ -615,7 +666,7 @@ def _prepare_embedding_work(
     view_texts_by_rewrite: dict[str, dict[str, str]] = {}
     now = utc_now()
 
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             for selected_rewrite_key in unique_rewrite_keys:
                 rewrite_row = conn.execute(
@@ -703,7 +754,7 @@ def _load_embedding_artifacts(
     selected_method_key: str,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     unique_rewrite_keys = list(dict.fromkeys(selected_rewrite_keys))
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         return _load_embedding_artifacts_from_conn(conn, unique_rewrite_keys, selected_method_key)
 
 
@@ -730,7 +781,7 @@ def _load_embedding_artifacts_from_conn(
 
 
 def get_artifact(settings: Settings, artifact_key: str) -> dict[str, Any] | None:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute("SELECT * FROM artifacts WHERE key = ?", (artifact_key,)).fetchone()
         return row_to_dict(row) if row else None
 
@@ -749,7 +800,7 @@ def _rewrite_payload(rewrite: RewriteResult, settings: Settings) -> dict[str, An
 
 
 def _mark_artifact_failed(settings: Settings, artifact_key: str, error: str) -> None:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -765,7 +816,7 @@ def _mark_artifacts_running(settings: Settings, artifact_keys: list[str]) -> Non
     if not artifact_keys:
         return
     placeholders = ",".join("?" for _ in artifact_keys)
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 f"""
@@ -783,7 +834,7 @@ def _store_embedding_items_batch(
     matrix: np.ndarray,
 ) -> None:
     now = utc_now()
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             for item, vector in zip(items, matrix, strict=True):
                 payload = {
@@ -828,7 +879,7 @@ def create_build_index_job(settings: Settings) -> dict[str, Any]:
         "embedding_method_key": selected_embedding_method_key,
         "problem_count": len(snapshot),
     }
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -870,6 +921,46 @@ def _group_snapshot_by_text_key(snapshot: list[dict[str, Any]]) -> dict[str, lis
     return grouped
 
 
+def _chunks(items: list[str], size: int = 800) -> list[list[str]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _load_succeeded_rewrites_for_text_keys(
+    settings: Settings,
+    text_keys: list[str],
+    selected_method_key: str,
+) -> dict[str, dict[str, Any]]:
+    if not text_keys:
+        return {}
+
+    rewrites: dict[str, dict[str, Any]] = {}
+    with db_read_connection(settings) as conn:
+        for chunk in _chunks(text_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM artifacts
+                WHERE kind = 'rewrite'
+                  AND method_key = ?
+                  AND status = 'succeeded'
+                  AND parent_key IN ({placeholders})
+                """,
+                [selected_method_key, *chunk],
+            ).fetchall()
+            for row in rows:
+                artifact = row_to_dict(row)
+                rewrites[str(artifact["parent_key"])] = artifact
+    return rewrites
+
+
+def _problem_count_for_text_keys(
+    text_keys: set[str],
+    grouped_by_text_key: dict[str, list[dict[str, Any]]],
+) -> int:
+    return sum(len(grouped_by_text_key.get(text_key, [])) for text_key in text_keys)
+
+
 def _ensure_rewrites_for_snapshot(
     settings: Settings,
     job_key: str,
@@ -879,73 +970,112 @@ def _ensure_rewrites_for_snapshot(
     failed_problem_keys: set[str],
 ) -> dict[str, dict[str, Any]]:
     grouped = _group_snapshot_by_text_key(snapshot)
-    items = list(grouped.items())
-    rewrite_by_text_key: dict[str, dict[str, Any]] = {}
-    if not items:
+    text_keys = list(grouped)
+    rewrite_by_text_key = _load_succeeded_rewrites_for_text_keys(
+        settings,
+        text_keys,
+        selected_method_key,
+    )
+    items = [(text_key, problems) for text_key, problems in grouped.items() if text_key not in rewrite_by_text_key]
+    processed = _problem_count_for_text_keys(set(rewrite_by_text_key), grouped)
+    if not text_keys:
         return rewrite_by_text_key
 
-    max_workers = max(1, min(settings.jobs.rewrite_concurrency, len(items)))
+    max_workers = max(1, min(settings.jobs.rewrite_concurrency, max(1, len(items))))
     append_job_log(
         settings,
         job_key,
         "info",
         "Rewrite phase started",
-        {"texts": len(items), "problems": len(snapshot), "concurrency": max_workers},
+        {
+            "texts": len(text_keys),
+            "cached_texts": len(rewrite_by_text_key),
+            "pending_texts": len(items),
+            "problems": len(snapshot),
+            "concurrency": max_workers if items else 0,
+        },
     )
     _update_job_progress(
         settings,
         job_key,
-        {"phase": "rewrite", "processed": 0, "total": len(snapshot), "failures": 0},
+        {"phase": "rewrite", "processed": processed, "total": len(snapshot), "failures": 0},
     )
+    if not items:
+        return rewrite_by_text_key
 
-    processed = 0
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yuantiji-rewrite") as pool:
-        futures = {
-            pool.submit(ensure_rewrite_artifact, settings, text_key, selected_method_key): text_key
-            for text_key, _ in items
-        }
-        for future in as_completed(futures):
-            text_key = futures[future]
-            problems = grouped[text_key]
-            try:
-                rewrite_by_text_key[text_key] = future.result()
-            except Exception as exc:
-                error = str(exc)
-                for problem in problems:
-                    _record_problem_failure(
-                        failures,
-                        failed_problem_keys,
-                        problem,
-                        "rewrite",
-                        error,
+    canceled = False
+    item_index = 0
+    futures: dict[Future[dict[str, Any]], str] = {}
+    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yuantiji-rewrite")
+
+    def submit_until_full() -> None:
+        nonlocal item_index
+        while len(futures) < max_workers and item_index < len(items):
+            text_key, _ = items[item_index]
+            item_index += 1
+            futures[pool.submit(ensure_rewrite_artifact, settings, text_key, selected_method_key)] = text_key
+
+    try:
+        submit_until_full()
+        while futures:
+            if _cancel_requested(settings, job_key):
+                canceled = True
+                break
+
+            done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+
+            for future in done:
+                text_key = futures.pop(future)
+                problems = grouped[text_key]
+                try:
+                    rewrite_by_text_key[text_key] = future.result()
+                except Exception as exc:
+                    error = str(exc)
+                    for problem in problems:
+                        _record_problem_failure(
+                            failures,
+                            failed_problem_keys,
+                            problem,
+                            "rewrite",
+                            error,
+                        )
+                    append_job_log(
+                        settings,
+                        job_key,
+                        "error",
+                        "Rewrite failed",
+                        {
+                            "problem_keys": [problem["key"] for problem in problems],
+                            "error": error,
+                        },
                     )
-                append_job_log(
+
+                processed += len(problems)
+                _update_job_progress(
                     settings,
                     job_key,
-                    "error",
-                    "Rewrite failed",
                     {
-                        "problem_keys": [problem["key"] for problem in problems],
-                        "error": error,
+                        "phase": "rewrite",
+                        "processed": processed,
+                        "total": len(snapshot),
+                        "failures": len(failures),
                     },
+                    {"failures": failures} if failures else None,
                 )
 
-            processed += len(problems)
-            _update_job_progress(
-                settings,
-                job_key,
-                {
-                    "phase": "rewrite",
-                    "processed": processed,
-                    "total": len(snapshot),
-                    "failures": len(failures),
-                },
-                {"failures": failures} if failures else None,
-            )
             if _cancel_requested(settings, job_key):
-                for pending in futures:
-                    pending.cancel()
+                canceled = True
                 break
+            submit_until_full()
+    finally:
+        if canceled:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            pool.shutdown(wait=True)
 
     return rewrite_by_text_key
 
@@ -984,6 +1114,8 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         if _job_progress(job).get("cancel_requested"):
             return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
+
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -1010,10 +1142,17 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         failures,
         failed_problem_keys,
     )
+    current_job = get_job(settings, job_key) or {}
+    current_progress = _job_progress(current_job)
     if canceled := _finish_if_cancel_requested(
         settings,
         job_key,
-        {"phase": "rewrite", "failures": failures, "processed": len(snapshot), "total": len(snapshot)},
+        {
+            "phase": "rewrite",
+            "failures": failures,
+            "processed": int(current_progress.get("processed") or 0),
+            "total": len(snapshot),
+        },
     ):
         return canceled
 
@@ -1061,6 +1200,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         {
             "pending_embeddings": len(pending_items),
             "batch_size": max(1, settings.jobs.embedding_batch_size),
+            "concurrency": max(1, settings.jobs.embedding_concurrency),
         },
     )
     _update_job_progress(
@@ -1083,86 +1223,125 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
 
     processed_embeddings = 0
     batch_size = max(1, settings.jobs.embedding_batch_size)
-    for start in range(0, len(pending_items), batch_size):
-        if canceled := _finish_if_cancel_requested(
-            settings,
-            job_key,
-            {
-                "phase": "embedding",
-                "failures": failures,
-                "processed": _problem_progress(
-                    completed_rewrite_keys,
-                    problems_by_rewrite_key,
-                    failed_problem_keys,
-                    len(snapshot),
-                ),
-                "total": len(snapshot),
-                "processed_embeddings": processed_embeddings,
-                "total_embeddings": len(pending_items),
-            },
-        ):
-            return canceled
+    batches = [pending_items[start : start + batch_size] for start in range(0, len(pending_items), batch_size)]
+    max_workers = max(1, min(settings.jobs.embedding_concurrency, max(1, len(batches))))
+    batch_index = 0
+    canceled = False
+    futures: dict[Future[list[EmbeddingWorkItem]], list[EmbeddingWorkItem]] = {}
 
-        batch = pending_items[start : start + batch_size]
+    def embed_batch(batch: list[EmbeddingWorkItem]) -> list[EmbeddingWorkItem]:
         batch_keys = [item.artifact_key for item in batch]
         _mark_artifacts_running(settings, batch_keys)
-        try:
-            vectors = embed_texts(
-                settings.embedding_model,
-                [item.text for item in batch],
-                timeout=settings.request_timeout,
-            )
-            matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
-            _store_embedding_items_batch(settings, batch, matrix)
-            for item in batch:
-                embedding_counts[item.rewrite_key] = embedding_counts.get(item.rewrite_key, 0) + 1
-                if embedding_counts[item.rewrite_key] == len(VIEWS):
-                    completed_rewrite_keys.add(item.rewrite_key)
-        except Exception as exc:
-            error = str(exc)
-            for key in batch_keys:
-                _mark_artifact_failed(settings, key, error)
-            affected_rewrite_keys = sorted({item.rewrite_key for item in batch})
-            for rewrite_key_value in affected_rewrite_keys:
-                for problem in problems_by_rewrite_key.get(rewrite_key_value, []):
-                    _record_problem_failure(
-                        failures,
-                        failed_problem_keys,
-                        problem,
-                        "embedding",
-                        error,
-                    )
-            append_job_log(
+        vectors = embed_texts(
+            settings.embedding_model,
+            [item.text for item in batch],
+            timeout=settings.request_timeout,
+        )
+        matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
+        _store_embedding_items_batch(settings, batch, matrix)
+        return batch
+
+    def submit_until_full(pool: ThreadPoolExecutor) -> None:
+        nonlocal batch_index
+        while len(futures) < max_workers and batch_index < len(batches):
+            batch = batches[batch_index]
+            batch_index += 1
+            futures[pool.submit(embed_batch, batch)] = batch
+
+    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yuantiji-embedding")
+    try:
+        submit_until_full(pool)
+        while futures:
+            if canceled := _finish_if_cancel_requested(
                 settings,
                 job_key,
-                "error",
-                "Embedding batch failed",
                 {
-                    "rewrite_keys": affected_rewrite_keys,
-                    "artifacts": len(batch),
-                    "error": error,
+                    "phase": "embedding",
+                    "failures": failures,
+                    "processed": _problem_progress(
+                        completed_rewrite_keys,
+                        problems_by_rewrite_key,
+                        failed_problem_keys,
+                        len(snapshot),
+                    ),
+                    "total": len(snapshot),
+                    "processed_embeddings": processed_embeddings,
+                    "total_embeddings": len(pending_items),
                 },
-            )
+            ):
+                break
 
-        processed_embeddings += len(batch)
-        _update_job_progress(
-            settings,
-            job_key,
-            {
-                "phase": "embedding",
-                "processed": _problem_progress(
-                    completed_rewrite_keys,
-                    problems_by_rewrite_key,
-                    failed_problem_keys,
-                    len(snapshot),
-                ),
-                "total": len(snapshot),
-                "failures": len(failures),
-                "processed_embeddings": processed_embeddings,
-                "total_embeddings": len(pending_items),
-            },
-            {"failures": failures} if failures else None,
-        )
+            done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+
+            for future in done:
+                batch = futures.pop(future)
+                batch_keys = [item.artifact_key for item in batch]
+                try:
+                    future.result()
+                except Exception as exc:
+                    error = str(exc)
+                    for key in batch_keys:
+                        _mark_artifact_failed(settings, key, error)
+                    affected_rewrite_keys = sorted({item.rewrite_key for item in batch})
+                    for rewrite_key_value in affected_rewrite_keys:
+                        for problem in problems_by_rewrite_key.get(rewrite_key_value, []):
+                            _record_problem_failure(
+                                failures,
+                                failed_problem_keys,
+                                problem,
+                                "embedding",
+                                error,
+                            )
+                    append_job_log(
+                        settings,
+                        job_key,
+                        "error",
+                        "Embedding batch failed",
+                        {
+                            "rewrite_keys": affected_rewrite_keys,
+                            "artifacts": len(batch),
+                            "error": error,
+                        },
+                    )
+                else:
+                    for item in batch:
+                        embedding_counts[item.rewrite_key] = embedding_counts.get(item.rewrite_key, 0) + 1
+                        if embedding_counts[item.rewrite_key] == len(VIEWS):
+                            completed_rewrite_keys.add(item.rewrite_key)
+
+                processed_embeddings += len(batch)
+                _update_job_progress(
+                    settings,
+                    job_key,
+                    {
+                        "phase": "embedding",
+                        "processed": _problem_progress(
+                            completed_rewrite_keys,
+                            problems_by_rewrite_key,
+                            failed_problem_keys,
+                            len(snapshot),
+                        ),
+                        "total": len(snapshot),
+                        "failures": len(failures),
+                        "processed_embeddings": processed_embeddings,
+                        "total_embeddings": len(pending_items),
+                    },
+                    {"failures": failures} if failures else None,
+                )
+
+            submit_until_full(pool)
+    finally:
+        if canceled:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            pool.shutdown(wait=True)
+
+    if canceled:
+        return canceled
 
     embedding_artifacts = _load_embedding_artifacts(
         settings,
@@ -1215,7 +1394,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     )
     cache_path = index_cache_path(settings, selected_index_key)
     now = utc_now()
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -1267,7 +1446,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     try:
         export_index_cache(settings, selected_index_key, prepared, cache_path)
         verify_index_cache(cache_path, selected_index_key)
-        with db_connection(settings) as conn:
+        with db_write_connection(settings) as conn:
             with conn:
                 conn.execute(
                     """
@@ -1292,7 +1471,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             None,
         )
     except Exception as exc:
-        with db_connection(settings) as conn:
+        with db_write_connection(settings) as conn:
             with conn:
                 conn.execute(
                     "UPDATE indexes SET status = 'failed', error = ? WHERE key = ?",
@@ -1435,7 +1614,7 @@ def rebuild_index_cache(settings: Settings, selected_index_key: str) -> dict[str
     cache_path = index_cache_path(settings, selected_index_key)
     export_index_cache(settings, selected_index_key, prepared, cache_path, force=True)
     verify_index_cache(cache_path, selected_index_key)
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -1452,7 +1631,7 @@ def rebuild_index_cache(settings: Settings, selected_index_key: str) -> dict[str
 
 
 def _read_enabled_problem_snapshot(settings: Settings) -> list[dict[str, Any]]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT key, title, url, text_key
@@ -1510,7 +1689,7 @@ def _build_index_rows(prepared: list[dict[str, Any]]) -> tuple[list[dict[str, An
 
 
 def _prepared_from_index_rows(settings: Settings, selected_index_key: str) -> list[dict[str, Any]]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT *
@@ -1614,7 +1793,7 @@ def _remove_dir_inside(root: Path, target: Path) -> int:
 def _active_import_uploads(settings: Settings) -> set[Path]:
     upload_root = settings.storage.upload_dir
     protected: set[Path] = set()
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT payload
@@ -1653,7 +1832,7 @@ def _cleanup_expired_uploads(settings: Settings) -> int:
 
 def _kept_index_cache_names(settings: Settings) -> set[str]:
     keep_keys: set[str] = set()
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         active = conn.execute(
             "SELECT value FROM kv WHERE key = 'active_index_key'"
         ).fetchone()
@@ -1711,6 +1890,8 @@ def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
         job = row_to_dict(row)
         if _job_progress(job).get("cancel_requested"):
             return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
+
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ?",

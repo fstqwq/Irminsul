@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 import uuid
@@ -23,7 +24,8 @@ from core import (
     batch_update_problems,
     cancel_job,
     create_cleanup_job,
-    db_connection,
+    db_read_connection,
+    db_write_connection,
     ensure_database,
     get_index,
     get_job,
@@ -46,19 +48,25 @@ from pipeline import (
     confirm_import_job,
     create_build_index_job,
     create_import_dry_run,
+    delete_import_draft,
+    embedding_method_key,
     index_cache_path,
     JobWorker,
     recover_startup,
     rebuild_index_cache,
+    rewrite_method_key,
     verify_index_cache,
 )
 from search import (
     IndexState,
+    VIEWS,
     get_search_audit,
     list_search_audits,
     load_index_cache,
     search_events_loaded,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
@@ -77,6 +85,7 @@ class LoginRequest(BaseModel):
 class ProblemPatch(BaseModel):
     title: str | None = None
     url: str | None = None
+    text: str | None = None
     enabled: bool | None = None
     deleted: bool | None = None
 
@@ -199,16 +208,32 @@ def _clear_session_cookies(response: Response) -> None:
 
 
 def _load_active_index(current_settings: Settings, state: IndexState) -> None:
-    with db_connection(current_settings) as conn:
+    with db_read_connection(current_settings) as conn:
         row = conn.execute("SELECT value FROM kv WHERE key = 'active_index_key'").fetchone()
     if row is None:
         return
-    selected_index_key = row["value"]
-    loaded = load_index_cache(
-        index_cache_path(current_settings, selected_index_key),
-        current_settings.index_cache.load_mode,
-    )
-    state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
+    selected_index_key = str(row["value"])
+    try:
+        loaded = load_index_cache(
+            index_cache_path(current_settings, selected_index_key),
+            current_settings.index_cache.load_mode,
+        )
+        state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
+    except Exception as exc:
+        logger.exception("Failed to load active index; starting without an active index")
+        try:
+            with db_write_connection(current_settings) as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE indexes
+                        SET error = ?
+                        WHERE key = ?
+                        """,
+                        (f"startup load failed: {exc}"[:4000], selected_index_key),
+                    )
+        except Exception:
+            logger.exception("Failed to record active index startup load error")
 
 
 def _activate_index(current_settings: Settings, selected_index_key: str, state: IndexState) -> None:
@@ -223,7 +248,7 @@ def _activate_index(current_settings: Settings, selected_index_key: str, state: 
     )
     state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
     now = utc_now()
-    with db_connection(current_settings) as conn:
+    with db_write_connection(current_settings) as conn:
         with conn:
             conn.execute("UPDATE indexes SET status = 'retired' WHERE status = 'active'")
             conn.execute(
@@ -436,14 +461,66 @@ def create_app() -> FastAPI:
     def dashboard(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
         current_settings = settings()
-        with db_connection(current_settings) as conn:
+        selected_rewrite_method_key = rewrite_method_key(current_settings)
+        selected_embedding_method_key = embedding_method_key(current_settings)
+        view_placeholders = ",".join("?" for _ in VIEWS)
+        with db_read_connection(current_settings) as conn:
             problem_count = conn.execute(
-                "SELECT count(*) FROM problems WHERE deleted = 0"
+                "SELECT count(*) FROM problems WHERE enabled = 1 AND deleted = 0"
+            ).fetchone()[0]
+            rewrite_problem_count = conn.execute(
+                """
+                SELECT count(DISTINCT p.key)
+                FROM problems p
+                JOIN artifacts r
+                  ON r.kind = 'rewrite'
+                 AND r.parent_key = p.text_key
+                 AND r.method_key = ?
+                 AND r.status = 'succeeded'
+                WHERE p.enabled = 1 AND p.deleted = 0
+                """,
+                (selected_rewrite_method_key,),
+            ).fetchone()[0]
+            embedding_problem_count = conn.execute(
+                f"""
+                SELECT count(*)
+                FROM (
+                  SELECT p.key
+                  FROM problems p
+                  JOIN artifacts r
+                    ON r.kind = 'rewrite'
+                   AND r.parent_key = p.text_key
+                   AND r.method_key = ?
+                   AND r.status = 'succeeded'
+                  JOIN artifacts e
+                    ON e.kind = 'embedding'
+                   AND e.parent_key = r.key
+                   AND e.method_key = ?
+                   AND e.status = 'succeeded'
+                   AND e.role IN ({view_placeholders})
+                  WHERE p.enabled = 1 AND p.deleted = 0
+                  GROUP BY p.key
+                  HAVING count(DISTINCT e.role) = ?
+                )
+                """,
+                (selected_rewrite_method_key, selected_embedding_method_key, *VIEWS, len(VIEWS)),
             ).fetchone()[0]
             source_count = conn.execute("SELECT count(*) FROM sources").fetchone()[0]
             active = conn.execute(
                 "SELECT value FROM kv WHERE key = 'active_index_key'"
             ).fetchone()
+            active_index_problem_count = None
+            if active:
+                active_index = conn.execute(
+                    "SELECT meta FROM indexes WHERE key = ?",
+                    (active["value"],),
+                ).fetchone()
+                if active_index:
+                    try:
+                        active_meta = json.loads(active_index["meta"])
+                        active_index_problem_count = int(active_meta.get("problem_count", 0))
+                    except (TypeError, ValueError):
+                        active_index_problem_count = 0
             current_job = conn.execute(
                 """
                 SELECT * FROM jobs
@@ -457,8 +534,11 @@ def create_app() -> FastAPI:
             ).fetchone()[0]
         return {
             "problem_count": problem_count,
+            "rewrite_problem_count": rewrite_problem_count,
+            "embedding_problem_count": embedding_problem_count,
             "source_count": source_count,
             "active_index_key": active["value"] if active else None,
+            "active_index_problem_count": active_index_problem_count,
             "current_job": _decode_job(row_to_dict(current_job)) if current_job else None,
             "today_searches": today_searches,
         }
@@ -538,7 +618,7 @@ def create_app() -> FastAPI:
         current_settings = settings()
         path = await _store_upload(file, current_settings)
         try:
-            return create_import_dry_run(path, mode, current_settings)
+            return create_import_dry_run(path, mode, current_settings, file.filename)
         except ValueError as exc:
             path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -553,6 +633,19 @@ def create_app() -> FastAPI:
             return _decode_job(confirm_import_job(job_key, settings()))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/admin/api/import/{job_key}")
+    def import_delete(
+        job_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return {"deleted": _decode_job(delete_import_draft(job_key, settings()))}
+        except ValueError as exc:
+            detail = str(exc)
+            status_code = 404 if "not found" in detail else 400
+            raise HTTPException(status_code=status_code, detail=detail) from exc
 
     @app.get("/admin/api/imports")
     def imports(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
@@ -737,18 +830,21 @@ def create_app() -> FastAPI:
                     "identity": current_settings.rewrite_model.identity,
                     "url": current_settings.rewrite_model.url,
                     "api_key_env": current_settings.rewrite_model.api_key_env,
+                    "provider": current_settings.rewrite_model.provider,
                 },
                 "embedding": {
                     "model": current_settings.embedding_model.model,
                     "identity": current_settings.embedding_model.identity,
                     "url": current_settings.embedding_model.url,
                     "api_key_env": current_settings.embedding_model.api_key_env,
+                    "provider": current_settings.embedding_model.provider,
                 },
                 "rerank": {
                     "model": current_settings.rerank_model.model,
                     "identity": current_settings.rerank_model.identity,
                     "url": current_settings.rerank_model.url,
                     "api_key_env": current_settings.rerank_model.api_key_env,
+                    "provider": current_settings.rerank_model.provider,
                 },
             },
             "search": current_settings.search.__dict__,

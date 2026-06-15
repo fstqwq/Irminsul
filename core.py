@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import tomllib
 import uuid
 from contextlib import contextmanager
@@ -21,6 +22,48 @@ DEFAULT_CONFIG_PATH = SRC_DIR / "config.toml"
 SCHEMA_VERSION = 2
 
 
+class WriterPriorityRwLock:
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
+    @contextmanager
+    def read_lock(self) -> Iterator[None]:
+        with self._condition:
+            while self._writer_active or self._writers_waiting > 0:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def write_lock(self) -> Iterator[None]:
+        with self._condition:
+            self._writers_waiting += 1
+            try:
+                while self._writer_active or self._readers > 0:
+                    self._condition.wait()
+                self._writer_active = True
+            finally:
+                self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer_active = False
+                self._condition.notify_all()
+
+
+_DB_RW_LOCK = WriterPriorityRwLock()
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     name: str
@@ -28,6 +71,7 @@ class ModelConfig:
     url: str
     api_key_env: str
     identity: str = ""
+    provider: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.identity:
@@ -67,6 +111,7 @@ class LimitsConfig:
 class JobsConfig:
     poll_seconds: int
     rewrite_concurrency: int
+    embedding_concurrency: int
     embedding_batch_size: int
 
 
@@ -151,6 +196,7 @@ def _model_config(name: str, data: dict[str, Any]) -> ModelConfig:
         url=str(data["url"]),
         api_key_env=str(data["api_key_env"]),
         identity=str(data.get("identity") or data["model"]),
+        provider=dict(data["provider"]) if isinstance(data.get("provider"), dict) else None,
     )
 
 
@@ -194,6 +240,7 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
         jobs=JobsConfig(
             poll_seconds=int(jobs.get("poll_seconds", 2)),
             rewrite_concurrency=int(jobs.get("rewrite_concurrency", 16)),
+            embedding_concurrency=int(jobs.get("embedding_concurrency", 4)),
             embedding_batch_size=int(jobs.get("embedding_batch_size", 128)),
         ),
         search=SearchConfig(
@@ -328,11 +375,11 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=60000")
     return conn
 
 
@@ -343,6 +390,26 @@ def db_connection(settings: Settings) -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def db_read_connection(settings: Settings) -> Iterator[sqlite3.Connection]:
+    with _DB_RW_LOCK.read_lock():
+        conn = connect_db(settings.storage.db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
+@contextmanager
+def db_write_connection(settings: Settings) -> Iterator[sqlite3.Connection]:
+    with _DB_RW_LOCK.write_lock():
+        conn = connect_db(settings.storage.db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -362,6 +429,23 @@ def migrate(conn: sqlite3.Connection) -> None:
 def ensure_database(settings: Settings) -> None:
     with db_connection(settings) as conn:
         migrate(conn)
+        ensure_query_indexes(conn)
+
+
+def ensure_query_indexes(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_artifacts_kind_method_status_parent
+              ON artifacts(kind, method_key, status, parent_key);
+
+            CREATE INDEX IF NOT EXISTS idx_artifacts_parent_kind_method_status_role
+              ON artifacts(parent_key, kind, method_key, status, role);
+
+            CREATE INDEX IF NOT EXISTS idx_problems_enabled_deleted_text
+              ON problems(enabled, deleted, text_key);
+            """
+        )
 
 
 def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
@@ -495,13 +579,13 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def get_job(settings: Settings, job_key: str) -> dict[str, Any] | None:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute("SELECT * FROM jobs WHERE key = ?", (job_key,)).fetchone()
         return row_to_dict(row) if row else None
 
 
 def list_import_jobs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT * FROM jobs
@@ -515,7 +599,7 @@ def list_import_jobs(settings: Settings, limit: int = 50) -> list[dict[str, Any]
 
 
 def list_indexes(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT * FROM indexes
@@ -528,7 +612,7 @@ def list_indexes(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def get_index(settings: Settings, selected_index_key: str) -> dict[str, Any] | None:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute("SELECT * FROM indexes WHERE key = ?", (selected_index_key,)).fetchone()
         return row_to_dict(row) if row else None
 
@@ -561,7 +645,7 @@ def list_problems(
     where_sql = " AND ".join(where)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         total = conn.execute(
             f"SELECT count(*) FROM problems WHERE {where_sql}",
             params,
@@ -580,7 +664,7 @@ def list_problems(
 
 
 def get_problem(settings: Settings, problem_key: str) -> dict[str, Any] | None:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute(
             """
             SELECT
@@ -643,25 +727,49 @@ def patch_problem(settings: Settings, problem_key: str, changes: dict[str, Any])
     allowed = {"title", "url", "enabled", "deleted"}
     assignments: list[str] = []
     params: list[Any] = []
+    now = utc_now()
     for key, value in changes.items():
         if key not in allowed or value is None:
             continue
         assignments.append(f"{key} = ?")
         params.append(int(value) if key in {"enabled", "deleted"} else str(value))
+    if "text" in changes and changes["text"] is not None:
+        text = canonical_text(str(changes["text"]))
+        if not text:
+            raise ValueError("text is required")
+        if len(text) > settings.limits.field_max_text_chars:
+            raise ValueError("text is too long")
+        new_text_key = text_key(text)
+        assignments.append("text_key = ?")
+        params.append(new_text_key)
     if not assignments:
         raise ValueError("no valid problem changes")
     assignments.append("updated_at = ?")
-    params.extend([utc_now(), problem_key])
-    with db_connection(settings) as conn:
+    params.extend([now, problem_key])
+    with db_write_connection(settings) as conn:
         with conn:
+            if "text" in changes and changes["text"] is not None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO artifacts(
+                      key, kind, parent_key, method_key, role, text, data, blob,
+                      status, error, updated_at
+                    )
+                    VALUES (?, 'problem_text', NULL, NULL, NULL, ?, NULL, NULL,
+                            'succeeded', NULL, ?)
+                    """,
+                    (new_text_key, text, now),
+                )
             cursor = conn.execute(
                 f"UPDATE problems SET {', '.join(assignments)} WHERE key = ?",
                 params,
             )
         if cursor.rowcount == 0:
             raise ValueError("problem not found")
-        row = conn.execute("SELECT * FROM problems WHERE key = ?", (problem_key,)).fetchone()
-    return row_to_dict(row)
+    updated = get_problem(settings, problem_key)
+    if updated is None:
+        raise ValueError("problem not found")
+    return updated
 
 
 def batch_update_problems(settings: Settings, keys: list[str], action: str) -> dict[str, Any]:
@@ -679,7 +787,7 @@ def batch_update_problems(settings: Settings, keys: list[str], action: str) -> d
         assignments = "deleted = 0"
 
     placeholders = ",".join("?" for _ in keys)
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             cursor = conn.execute(
                 f"""
@@ -693,7 +801,7 @@ def batch_update_problems(settings: Settings, keys: list[str], action: str) -> d
 
 
 def list_sources(settings: Settings) -> list[dict[str, Any]]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT
@@ -723,7 +831,7 @@ def patch_source(settings: Settings, source_key: str, changes: dict[str, Any]) -
         raise ValueError("no valid source changes")
     assignments.append("updated_at = ?")
     params.extend([utc_now(), source_key])
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             cursor = conn.execute(
                 f"UPDATE sources SET {', '.join(assignments)} WHERE key = ?",
@@ -750,7 +858,7 @@ def list_jobs(
         where.append("status = ?")
         params.append(status)
     limit = max(1, min(limit, 500))
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             f"""
             SELECT * FROM jobs
@@ -770,7 +878,7 @@ def append_job_log(
     message: str,
     data: dict[str, Any] | None = None,
 ) -> None:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -783,7 +891,7 @@ def append_job_log(
 
 def list_job_logs(settings: Settings, job_key: str, limit: int = 500) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 2000))
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             """
             SELECT * FROM job_logs
@@ -802,7 +910,7 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
         raise ValueError("job not found")
     if job["status"] not in {"blocked", "failed"}:
         raise ValueError("job is not retryable")
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -829,7 +937,7 @@ def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
     result = job_result(job)
     result["canceled"] = True
     now = utc_now()
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             if job["status"] in {"draft", "queued"}:
                 conn.execute(
@@ -865,7 +973,7 @@ def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
 def create_cleanup_job(settings: Settings) -> dict[str, Any]:
     job_key = "j:" + uuid.uuid4().hex
     now = utc_now()
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -881,7 +989,7 @@ def create_cleanup_job(settings: Settings) -> dict[str, Any]:
 
 
 def mark_job_failed(settings: Settings, job_key: str, error: str) -> None:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -945,7 +1053,7 @@ def update_job_progress(
     progress: dict[str, Any],
     result: dict[str, Any] | None = None,
 ) -> None:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             row = conn.execute("SELECT progress FROM jobs WHERE key = ?", (job_key,)).fetchone()
             if row is not None:
@@ -972,7 +1080,7 @@ def finish_job(
     result: dict[str, Any],
     error: str | None,
 ) -> dict[str, Any]:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
