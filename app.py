@@ -35,6 +35,7 @@ from pipeline import (
     create_import_dry_run,
     get_index,
     get_job,
+    get_problem,
     index_cache_path,
     JobWorker,
     list_jobs,
@@ -443,6 +444,17 @@ def create_app() -> FastAPI:
             return batch_update_problems(settings(), payload.keys, action)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/problems/{problem_key:path}")
+    def problem_detail(
+        problem_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        problem = get_problem(settings(), problem_key)
+        if problem is None:
+            raise HTTPException(status_code=404, detail="Problem not found")
+        return problem
 
     @app.patch("/admin/api/problems/{problem_key:path}")
     def problem_patch(

@@ -237,6 +237,10 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         assert problems.json()["total"] == 1
         assert problems.json()["items"][0]["title"] == "Theatre Square"
 
+        problem_detail = client.get("/admin/api/problems/CodeForces/1A")
+        assert problem_detail.status_code == 200
+        assert problem_detail.json()["text"] == "Calculate paving stones."
+
         patched_problem = client.patch(
             "/admin/api/problems/CodeForces/1A",
             json={"title": "Updated Theatre Square"},

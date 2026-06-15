@@ -68,6 +68,54 @@ const pages: { id: AdminPage; label: string }[] = [
   { id: "settings", label: "Settings" }
 ];
 
+const importModeLabels: Record<string, string> = {
+  upsert: "Update or add",
+  insert_only: "Add new only (skip existing)",
+  sync_source: "Sync source (disable missing)"
+};
+
+const jobTypeLabels: Record<string, string> = {
+  import: "Import",
+  build_index: "Build Index",
+  activate_index: "Activate Index",
+  cleanup: "Cleanup"
+};
+
+const statusLabels: Record<string, string> = {
+  draft: "Draft",
+  queued: "Queued",
+  running: "Running",
+  succeeded: "Succeeded",
+  blocked: "Blocked",
+  failed: "Failed",
+  building: "Building",
+  built: "Ready",
+  active: "Active",
+  retired: "Retired"
+};
+
+const settingsKeyLabels: Record<string, string> = {
+  db_path: "Database path",
+  upload_dir: "Upload directory",
+  index_cache_dir: "Cache directory",
+  top_per_doc_view: "Candidates per view",
+  top_retrieval: "Retrieved candidates",
+  top_display: "Displayed results",
+  rerank_top_k: "Rerank candidates",
+  alpha: "Alpha",
+  beta: "Beta (rerank weight)",
+  default_rerank: "Rerank by default",
+  rerank_range_floor: "Rerank range floor",
+  embedding_range_floor: "Embedding range floor",
+  keep_retired: "Retained old indexes",
+  load_mode: "Load mode",
+  activation_drain_timeout_seconds: "Activation drain timeout (s)",
+  name: "Provider",
+  model: "Model",
+  url: "Endpoint",
+  api_key_env: "API key environment variable"
+};
+
 const state: AdminState = {
   page: pageFromHash(),
   authenticated: false,
@@ -273,7 +321,7 @@ function renderDashboard(data: Row = {}): string {
     <section class="admin-grid">
       ${metric("Problems", data.problem_count)}
       ${metric("Sources", data.source_count)}
-      ${metric("Active index", data.active_index_key || "None")}
+      ${metric("Active index", data.active_index_key || "None", "key")}
       ${metric("Today searches", data.today_searches)}
     </section>
     <section class="admin-panel">
@@ -281,11 +329,11 @@ function renderDashboard(data: Row = {}): string {
       ${
         Object.keys(currentJob).length
           ? detailGrid([
-              ["Key", currentJob.key],
-              ["Type", currentJob.type],
-              ["Status", currentJob.status],
-              ["Updated", currentJob.updated_at]
-            ]) + jsonBlock("Progress", currentJob.progress)
+              ["Job ID", currentJob.key, "key"],
+              ["Type", currentJob.type, "jobType"],
+              ["Status", currentJob.status, "status"],
+              ["Updated", currentJob.updated_at, "date"]
+            ]) + htmlBlock("Progress", escapeHtml(formatProgress(currentJob.type, currentJob.progress)))
           : `<div class="admin-empty">No queued or running job.</div>`
       }
     </section>`;
@@ -299,16 +347,18 @@ function renderImports(data: Row = {}): string {
       <form id="importForm" class="admin-inline-form">
         <input name="file" type="file" accept=".jsonl,application/jsonl">
         <select name="mode">
-          <option value="upsert">upsert</option>
-          <option value="insert_only">insert_only</option>
-          <option value="sync_source">sync_source</option>
+          ${Object.entries(importModeLabels)
+            .map(
+              ([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`
+            )
+            .join("")}
         </select>
         <button type="submit">Dry run</button>
       </form>
       ${state.draftImport ? renderDraftImport(state.draftImport) : ""}
     </section>
     ${state.details.import ? renderImportDetail(state.details.import) : ""}
-    ${table(["Key", "Status", "Progress", "Updated", ""], items || emptyRow(5))}`;
+    ${table(["Import ID", "Status", "Progress", "Updated", ""], items || emptyRow(5))}`;
 }
 
 function importRow(item: Row): string {
@@ -316,10 +366,10 @@ function importRow(item: Row): string {
   const status = String(item.status || "");
   return `
     <tr>
-      <td>${escapeHtml(key)}</td>
+      <td>${shortKey(key)}</td>
       <td>${statusBadge(status)}</td>
-      <td><code>${escapeHtml(compactJson(item.progress))}</code></td>
-      <td>${escapeHtml(String(item.updated_at || ""))}</td>
+      <td>${escapeHtml(formatProgress(item.type || "import", item.progress))}</td>
+      <td>${shortDate(item.updated_at)}</td>
       <td class="admin-actions">
         <button data-import-detail="${escapeHtml(key)}" type="button">View</button>
         ${status === "draft" ? `<button data-confirm-import="${escapeHtml(key)}" type="button">Confirm</button>` : ""}
@@ -332,10 +382,10 @@ function renderDraftImport(draft: Row): string {
   const errors = Array.isArray(stats.errors) ? stats.errors : [];
   return `
     <div class="admin-draft">
-      <span>new ${value(stats.new)}</span>
-      <span>overwrite ${value(stats.overwrite)}</span>
-      <span>skip ${value(stats.skip)}</span>
-      <span>errors ${errors.length}</span>
+      <span>New: ${value(stats.new)}</span>
+      <span>Updated: ${value(stats.overwrite)}</span>
+      <span>Skipped: ${value(stats.skip)}</span>
+      <span>Errors: ${errors.length}</span>
       <button data-confirm-import="${escapeHtml(String(draft.job_key))}" type="button">Confirm</button>
     </div>
     ${errors.length ? jsonBlock("Errors", errors) : ""}`;
@@ -345,12 +395,12 @@ function renderImportDetail(job: Row): string {
   return detailPanel(
     "Import detail",
     detailGrid([
-      ["Key", job.key],
-      ["Status", job.status],
-      ["Created", job.created_at],
-      ["Updated", job.updated_at]
+      ["Import ID", job.key, "key"],
+      ["Status", job.status, "status"],
+      ["Created", job.created_at, "date"],
+      ["Updated", job.updated_at, "date"],
+      ["Progress", formatProgress(job.type || "import", job.progress)]
     ]) +
-      jsonBlock("Progress", job.progress) +
       jsonBlock("Result", job.result) +
       jsonBlock("Error", job.error),
     "import"
@@ -370,14 +420,14 @@ function renderProblems(data: Row = {}): string {
         <input name="q" value="${escapeHtml(filters.q)}" placeholder="Keyword">
         <input name="source_key" value="${escapeHtml(filters.source_key)}" placeholder="Source">
         ${select("enabled", filters.enabled, [
-          ["", "enabled: any"],
-          ["true", "enabled"],
-          ["false", "disabled"]
+          ["", "Enabled: any"],
+          ["true", "Enabled only"],
+          ["false", "Disabled only"]
         ])}
         ${select("deleted", filters.deleted, [
-          ["", "deleted: any"],
-          ["false", "active"],
-          ["true", "deleted"]
+          ["", "Deleted: any"],
+          ["false", "Active only"],
+          ["true", "Deleted only"]
         ])}
         <button type="submit">Apply</button>
       </form>
@@ -390,7 +440,7 @@ function renderProblems(data: Row = {}): string {
         <button data-page-problems="1" type="button" ${filters.offset + filters.limit >= total ? "disabled" : ""}>Next</button>
       </div>
     </div>
-    ${table(["Key", "Title", "Source", "Enabled", "Deleted", "Updated", ""], items || emptyRow(7))}`;
+    ${table(["ID", "Title", "Source", "Enabled", "Deleted", "Updated", ""], items || emptyRow(7))}`;
 }
 
 function problemRow(item: Row): string {
@@ -404,9 +454,9 @@ function problemRow(item: Row): string {
       <td>${escapeHtml(String(item.source_key || ""))}</td>
       <td>${flag(enabled)}</td>
       <td>${flag(deleted)}</td>
-      <td>${escapeHtml(String(item.updated_at || ""))}</td>
+      <td>${shortDate(item.updated_at)}</td>
       <td class="admin-actions">
-        <button data-edit-problem="${escapeHtml(key)}" type="button">Edit</button>
+        <button data-edit-problem="${escapeHtml(key)}" type="button">Preview</button>
         <button data-problem-patch="${escapeHtml(key)}" data-enabled="${enabled ? "false" : "true"}" type="button">
           ${enabled ? "Disable" : "Enable"}
         </button>
@@ -419,16 +469,20 @@ function problemRow(item: Row): string {
 
 function renderProblemEditor(problem: Row): string {
   return detailPanel(
-    "Edit problem",
+    "Problem detail",
     `
       <form id="problemEditForm" class="admin-edit-form">
-        <label>Key<input name="key" value="${escapeHtml(String(problem.key || ""))}" readonly></label>
+        <label>ID<input name="key" value="${escapeHtml(String(problem.key || ""))}" readonly></label>
         <label>Title<input name="title" value="${escapeHtml(String(problem.title || ""))}"></label>
         <label>URL<input name="url" value="${escapeHtml(String(problem.url || ""))}"></label>
         <label><input name="enabled" type="checkbox" ${truthy(problem.enabled) ? "checked" : ""}> Enabled</label>
         <label><input name="deleted" type="checkbox" ${truthy(problem.deleted) ? "checked" : ""}> Deleted</label>
+        <label>
+          Statement preview
+          <textarea readonly rows="16">${escapeHtml(String(problem.text || ""))}</textarea>
+        </label>
         <div class="admin-actions">
-          <button type="submit">Save</button>
+          <button type="submit">Save metadata</button>
           <button data-close-detail="problem" type="button">Cancel</button>
         </div>
       </form>`,
@@ -459,7 +513,7 @@ function renderSources(data: Row = {}): string {
     })
     .join("");
   return table(
-    ["Key", "Name", "Enabled", "Problems", "Active", "Deleted", ""],
+    ["ID", "Name", "Enabled", "Problems", "Active", "Deleted", ""],
     items || emptyRow(7)
   );
 }
@@ -468,11 +522,11 @@ function renderIndexes(data: Row = {}): string {
   const items = asRows(data.items).map(indexRow).join("");
   return `
     <section class="admin-panel">
-      <button id="buildIndex" type="button">Build index</button>
-      <button id="cleanupJob" type="button">Cleanup</button>
+      <button id="buildIndex" type="button">Build new index</button>
+      <button id="cleanupJob" type="button">Run cleanup</button>
     </section>
     ${state.details.index ? renderIndexDetail(state.details.index) : ""}
-    ${table(["Key", "Status", "Created", "Activated", ""], items || emptyRow(5))}`;
+    ${table(["ID", "Status", "Created", "Activated", ""], items || emptyRow(5))}`;
 }
 
 function indexRow(item: Row): string {
@@ -480,14 +534,14 @@ function indexRow(item: Row): string {
   const status = String(item.status || "");
   return `
     <tr>
-      <td>${escapeHtml(key)}</td>
+      <td>${shortKey(key)}</td>
       <td>${statusBadge(status)}</td>
-      <td>${escapeHtml(String(item.created_at || ""))}</td>
-      <td>${escapeHtml(String(item.activated_at || ""))}</td>
+      <td>${shortDate(item.created_at)}</td>
+      <td>${shortDate(item.activated_at)}</td>
       <td class="admin-actions">
         <button data-index-detail="${escapeHtml(key)}" type="button">View</button>
         <button data-activate-index="${escapeHtml(key)}" type="button">Activate</button>
-        <button data-verify-index="${escapeHtml(key)}" type="button">Verify</button>
+        <button data-verify-index="${escapeHtml(key)}" type="button">Check integrity</button>
         <button data-rebuild-index="${escapeHtml(key)}" type="button">Rebuild cache</button>
       </td>
     </tr>`;
@@ -497,12 +551,12 @@ function renderIndexDetail(index: Row): string {
   return detailPanel(
     "Index detail",
     detailGrid([
-      ["Key", index.key],
-      ["Status", index.status],
-      ["Created", index.created_at],
-      ["Activated", index.activated_at]
+      ["ID", index.key, "key"],
+      ["Status", index.status, "status"],
+      ["Created", index.created_at, "date"],
+      ["Activated", index.activated_at, "date"]
     ]) +
-      jsonBlock("Meta", index.meta) +
+      renderIndexMeta(index.meta) +
       jsonBlock("Error", index.error),
     "index"
   );
@@ -516,26 +570,26 @@ function renderJobs(data: Row = {}): string {
       <h2>Filters</h2>
       <form id="jobFilterForm" class="admin-inline-form">
         ${select("type", filters.type, [
-          ["", "type: any"],
-          ["import", "import"],
-          ["build_index", "build_index"],
-          ["activate_index", "activate_index"],
-          ["cleanup", "cleanup"]
+          ["", "Type: any"],
+          ["import", jobTypeLabels.import],
+          ["build_index", jobTypeLabels.build_index],
+          ["activate_index", jobTypeLabels.activate_index],
+          ["cleanup", jobTypeLabels.cleanup]
         ])}
         ${select("status", filters.status, [
-          ["", "status: any"],
-          ["draft", "draft"],
-          ["queued", "queued"],
-          ["running", "running"],
-          ["succeeded", "succeeded"],
-          ["blocked", "blocked"],
-          ["failed", "failed"]
+          ["", "Status: any"],
+          ["draft", statusLabels.draft],
+          ["queued", statusLabels.queued],
+          ["running", statusLabels.running],
+          ["succeeded", statusLabels.succeeded],
+          ["blocked", statusLabels.blocked],
+          ["failed", statusLabels.failed]
         ])}
         <button type="submit">Apply</button>
       </form>
     </section>
     ${state.details.job ? renderJobDetail(state.details.job) : ""}
-    ${table(["Key", "Type", "Status", "Progress", "Updated", ""], items || emptyRow(6))}`;
+    ${table(["Job ID", "Type", "Status", "Progress", "Updated", ""], items || emptyRow(6))}`;
 }
 
 function jobRow(item: Row): string {
@@ -543,11 +597,11 @@ function jobRow(item: Row): string {
   const status = String(item.status || "");
   return `
     <tr>
-      <td>${escapeHtml(key)}</td>
-      <td>${escapeHtml(String(item.type || ""))}</td>
+      <td>${shortKey(key)}</td>
+      <td>${escapeHtml(label(jobTypeLabels, item.type))}</td>
       <td>${statusBadge(status)}</td>
-      <td><code>${escapeHtml(compactJson(item.progress))}</code></td>
-      <td>${escapeHtml(String(item.updated_at || ""))}</td>
+      <td>${escapeHtml(formatProgress(item.type, item.progress))}</td>
+      <td>${shortDate(item.updated_at)}</td>
       <td class="admin-actions">
         <button data-job-detail="${escapeHtml(key)}" type="button">View</button>
         ${["blocked", "failed"].includes(status) ? `<button data-retry-job="${escapeHtml(key)}" type="button">Retry</button>` : ""}
@@ -560,14 +614,14 @@ function renderJobDetail(job: Row): string {
   return detailPanel(
     "Job detail",
     detailGrid([
-      ["Key", job.key],
-      ["Type", job.type],
-      ["Status", job.status],
-      ["Created", job.created_at],
-      ["Updated", job.updated_at]
+      ["Job ID", job.key, "key"],
+      ["Type", job.type, "jobType"],
+      ["Status", job.status, "status"],
+      ["Created", job.created_at, "date"],
+      ["Updated", job.updated_at, "date"],
+      ["Progress", formatProgress(job.type, job.progress)]
     ]) +
       jsonBlock("Payload", job.payload) +
-      jsonBlock("Progress", job.progress) +
       jsonBlock("Result", job.result) +
       jsonBlock("Error", job.error) +
       (["blocked", "failed"].includes(status)
@@ -588,9 +642,9 @@ function renderAudits(data: Row = {}): string {
         <input name="date_from" value="${escapeHtml(filters.date_from)}" type="date">
         <input name="date_to" value="${escapeHtml(filters.date_to)}" type="date">
         ${select("status", filters.status, [
-          ["", "status: any"],
-          ["succeeded", "succeeded"],
-          ["failed", "failed"]
+          ["", "Status: any"],
+          ["succeeded", statusLabels.succeeded],
+          ["failed", statusLabels.failed]
         ])}
         <button type="submit">Apply</button>
       </form>
@@ -603,10 +657,10 @@ function auditRow(item: Row): string {
   const requestId = String(item.request_id || "");
   return `
     <tr>
-      <td>${escapeHtml(String(item.started_at || ""))}</td>
+      <td>${shortDate(item.started_at)}</td>
       <td>${statusBadge(String(item.status || ""))}</td>
-      <td>${escapeHtml(String(item.query || "")).slice(0, 160)}</td>
-      <td>${value(asRecord(item.cost).microusd)}</td>
+      <td>${truncateText(item.query, 160)}</td>
+      <td>${formatCost(item.cost)}</td>
       <td><button data-audit-detail="${escapeHtml(requestId)}" type="button">View</button></td>
     </tr>`;
 }
@@ -615,17 +669,17 @@ function renderAuditDetail(audit: Row): string {
   return detailPanel(
     "Audit detail",
     detailGrid([
-      ["Request", audit.request_id],
-      ["Status", audit.status],
-      ["Started", audit.started_at],
-      ["Finished", audit.finished_at],
+      ["Request", audit.request_id, "key"],
+      ["Status", audit.status, "status"],
+      ["Started", audit.started_at, "date"],
+      ["Finished", audit.finished_at, "date"],
       ["Client IP", audit.client_ip],
-      ["User agent", audit.user_agent]
+      ["User agent", audit.user_agent],
+      ["Cost", audit.cost, "cost"]
     ]) +
       `<div class="admin-detail-block"><h3>Query</h3><p>${escapeHtml(String(audit.query || ""))}</p></div>` +
       jsonBlock("Timings", audit.timings) +
       jsonBlock("API calls", audit.api_calls) +
-      jsonBlock("Cost", audit.cost) +
       jsonBlock("Result", audit.result) +
       jsonBlock("Error", audit.error),
     "audit"
@@ -655,7 +709,7 @@ function settingsSection(title: string, values: Row): string {
     .map(
       ([key, raw]) => `
       <tr>
-        <th>${escapeHtml(key)}</th>
+        <th>${escapeHtml(label(settingsKeyLabels, key))}</th>
         <td>${escapeHtml(String(raw ?? ""))}</td>
       </tr>`
     )
@@ -667,8 +721,10 @@ function settingsSection(title: string, values: Row): string {
     </section>`;
 }
 
-function metric(label: string, raw: unknown): string {
-  return `<div class="admin-metric"><span>${label}</span><b>${escapeHtml(String(raw ?? "0"))}</b></div>`;
+type DisplayKind = "text" | "key" | "date" | "status" | "jobType" | "cost";
+
+function metric(labelText: string, raw: unknown, kind: DisplayKind = "text"): string {
+  return `<div class="admin-metric"><span>${escapeHtml(labelText)}</span><b>${formatDisplay(raw, kind)}</b></div>`;
 }
 
 function table(headers: string[], rows: string): string {
@@ -696,19 +752,28 @@ function detailPanel(title: string, body: string, key: keyof AdminState["details
     </section>`;
 }
 
-function detailGrid(rows: [string, unknown][]): string {
+function detailGrid(rows: [string, unknown, DisplayKind?][]): string {
   return `
     <dl class="admin-detail-grid">
       ${rows
         .map(
-          ([key, raw]) => `
+          ([key, raw, kind]) => `
           <div>
             <dt>${escapeHtml(key)}</dt>
-            <dd>${escapeHtml(String(raw ?? ""))}</dd>
+            <dd>${formatDisplay(raw, kind || "text")}</dd>
           </div>`
         )
         .join("")}
     </dl>`;
+}
+
+function htmlBlock(title: string, body: string): string {
+  if (!body) return "";
+  return `
+    <div class="admin-detail-block">
+      <h3>${escapeHtml(title)}</h3>
+      <p>${body}</p>
+    </div>`;
 }
 
 function jsonBlock(title: string, raw: unknown): string {
@@ -739,11 +804,11 @@ function value(raw: unknown): string {
 }
 
 function flag(raw: unknown): string {
-  return truthy(raw) ? "yes" : "no";
+  return truthy(raw) ? "&#10003;" : "&#10007;";
 }
 
 function statusBadge(status: string): string {
-  return `<span class="admin-badge status-${escapeHtml(status)}">${escapeHtml(status || "unknown")}</span>`;
+  return `<span class="admin-badge status-${escapeHtml(status)}">${escapeHtml(label(statusLabels, status) || "Unknown")}</span>`;
 }
 
 function compactJson(raw: unknown): string {
@@ -752,14 +817,126 @@ function compactJson(raw: unknown): string {
 }
 
 function formatJson(raw: unknown): string {
-  if (typeof raw === "string") {
-    try {
-      return JSON.stringify(JSON.parse(raw), null, 2);
-    } catch {
-      return raw;
-    }
+  const parsed = parseMaybeJson(raw);
+  return typeof parsed === "string" ? parsed : JSON.stringify(parsed ?? {}, null, 2);
+}
+
+function parseMaybeJson(raw: unknown): unknown {
+  if (typeof raw !== "string") return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
   }
-  return JSON.stringify(raw ?? {}, null, 2);
+}
+
+function label(map: Record<string, string>, raw: unknown): string {
+  const key = String(raw || "");
+  return map[key] || key;
+}
+
+function formatDisplay(raw: unknown, kind: DisplayKind = "text"): string {
+  if (kind === "key") return shortKey(raw);
+  if (kind === "date") return shortDate(raw);
+  if (kind === "status") return statusBadge(String(raw || ""));
+  if (kind === "jobType") return escapeHtml(label(jobTypeLabels, raw));
+  if (kind === "cost") return formatCost(raw);
+  return escapeHtml(String(raw ?? ""));
+}
+
+function shortKey(raw: unknown): string {
+  const text = String(raw || "");
+  if (text.length > 12) {
+    return `<span title="${escapeHtml(text)}">${escapeHtml(text.slice(0, 10))}...</span>`;
+  }
+  return escapeHtml(text);
+}
+
+function shortDate(raw: unknown): string {
+  const text = String(raw || "");
+  if (!text) return "";
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return escapeHtml(text);
+  const display = `${date.toLocaleDateString("en", {
+    month: "short",
+    day: "numeric"
+  })}, ${date.toLocaleTimeString("en", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  })}`;
+  return `<span title="${escapeHtml(text)}">${escapeHtml(display)}</span>`;
+}
+
+function formatCost(raw: unknown): string {
+  const parsed = parseMaybeJson(raw);
+  const cost = asRecord(parsed);
+  const micro = typeof parsed === "number" ? parsed : Number(cost.microusd || 0);
+  const safeMicro = Number.isFinite(micro) ? micro : 0;
+  const dollars = (safeMicro / 1_000_000).toFixed(6);
+  return `<span title="${escapeHtml(String(safeMicro))} microUSD">$${escapeHtml(dollars)}</span>`;
+}
+
+function formatProgress(type: unknown, progress: unknown): string {
+  const parsed = parseMaybeJson(progress);
+  const data = asRecord(parsed);
+  if (!Object.keys(data).length) return "";
+
+  const stats = asRecord(data.stats);
+  if (Object.keys(stats).length) {
+    const errors = Array.isArray(stats.errors) ? stats.errors.length : Number(stats.errors || 0);
+    return `New: ${Number(stats.new || 0)}, Updated: ${Number(stats.overwrite || 0)}, Skipped: ${Number(
+      stats.skip || 0
+    )}, Errors: ${errors}`;
+  }
+
+  const kind = String(type || "");
+  const processed = Number(data.processed || 0);
+  const total = Number(data.total || 0);
+  if (total > 0) {
+    const unit = kind === "import" ? "rows" : "problems";
+    const failures = Number(data.failures || 0);
+    return `${processed} / ${total} ${unit}${failures ? `, ${failures} failed` : ""}`;
+  }
+
+  const succeededRewrites = Number(data.succeeded_rewrites || 0);
+  const succeededEmbeddings = Number(data.succeeded_embeddings || 0);
+  const totalRewrites = Number(data.total_rewrites || 0);
+  const totalEmbeddings = Number(data.total_embeddings || 0);
+  const artifactTotal = totalRewrites + totalEmbeddings;
+  if (artifactTotal > 0) {
+    return `${succeededRewrites + succeededEmbeddings} / ${artifactTotal} artifacts`;
+  }
+
+  const phase = String(data.phase || "");
+  if (phase) return titleCase(phase.replace(/_/g, " "));
+  return compactJson(progress);
+}
+
+function titleCase(text: string): string {
+  return text.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function truncateText(raw: unknown, maxLength: number): string {
+  const text = String(raw || "");
+  const clipped = text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+  return escapeHtml(clipped);
+}
+
+function renderIndexMeta(raw: unknown): string {
+  const meta = asRecord(parseMaybeJson(raw));
+  if (!Object.keys(meta).length) return "";
+  return `
+    <div class="admin-detail-block">
+      <h3>Index metadata</h3>
+      ${detailGrid([
+        ["Problem count", meta.problem_count],
+        ["Schema version", meta.schema_version],
+        ["Rewrite method", meta.rewrite_method_key, "key"],
+        ["Embedding method", meta.embedding_method_key, "key"],
+        ["Cache path", meta.cache_path]
+      ])}
+    </div>`;
 }
 
 function asRecord(raw: unknown): Row {
@@ -776,10 +953,6 @@ function truthy(raw: unknown): boolean {
 
 function pathKey(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
-}
-
-function currentProblem(key: string): Row | null {
-  return asRows(asRecord(state.data.problems).items).find((item) => String(item.key) === key) || null;
 }
 
 function bindLogin(): void {
@@ -843,6 +1016,7 @@ function bindImports(): void {
   rootEl.querySelectorAll<HTMLButtonElement>("[data-confirm-import]").forEach((button) => {
     button.addEventListener("click", () => {
       const key = button.dataset.confirmImport || "";
+      if (!window.confirm("Start this import job now?")) return;
       void api(`/admin/api/import/${encodeURIComponent(key)}/confirm`, { method: "POST" })
         .then(() => {
           state.draftImport = null;
@@ -892,8 +1066,13 @@ function bindProblems(): void {
 
   rootEl.querySelectorAll<HTMLButtonElement>("[data-edit-problem]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.details.problem = currentProblem(button.dataset.editProblem || "");
-      render();
+      const key = button.dataset.editProblem || "";
+      void api<Row>(`/admin/api/problems/${pathKey(key)}`)
+        .then((detail) => {
+          state.details.problem = detail;
+          render();
+        })
+        .catch(showError);
     });
   });
 
@@ -903,6 +1082,8 @@ function bindProblems(): void {
       const body: Row = {};
       if (button.dataset.enabled !== undefined) body.enabled = button.dataset.enabled === "true";
       if (button.dataset.deleted !== undefined) body.deleted = button.dataset.deleted === "true";
+      if (body.enabled === false && !window.confirm("Disable this problem?")) return;
+      if (body.deleted === true && !window.confirm("Delete this problem? It can be restored later.")) return;
       void patchProblem(key, body);
     });
   });
@@ -936,6 +1117,7 @@ function bindSources(): void {
     button.addEventListener("click", () => {
       const key = button.dataset.sourceToggle || "";
       const enabled = button.dataset.enabled === "true";
+      if (enabled && !window.confirm("Disable this source?")) return;
       void api(`/admin/api/sources/${encodeURIComponent(key)}`, {
         method: "PATCH",
         body: JSON.stringify({ enabled: !enabled })
@@ -990,6 +1172,7 @@ function bindIndexes(): void {
 
   rootEl.querySelectorAll<HTMLButtonElement>("[data-activate-index]").forEach((button) => {
     button.addEventListener("click", () => {
+      if (!window.confirm("Activate this index and switch search traffic to it?")) return;
       void api(`/admin/api/index/${encodeURIComponent(button.dataset.activateIndex || "")}/activate`, {
         method: "POST"
       })
@@ -1055,6 +1238,7 @@ function bindJobs(): void {
   rootEl.querySelectorAll<HTMLButtonElement>("[data-retry-job]").forEach((button) => {
     button.addEventListener("click", () => {
       const key = button.dataset.retryJob || "";
+      if (!window.confirm("Queue this job for retry?")) return;
       void api(`/admin/api/jobs/${encodeURIComponent(key)}/retry`, { method: "POST" })
         .then(() => {
           state.notice = "Job queued for retry.";

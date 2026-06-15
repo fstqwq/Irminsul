@@ -399,6 +399,11 @@ def rerank_documents_with_usage(
     if not isinstance(scores, list) or len(scores) != len(documents):
         raise ValueError(f"Unexpected reranker response: {payload}")
     usage = _public_usage(payload.get("usage"))
+    if "input_tokens" in payload:
+        usage.setdefault("input_tokens", payload["input_tokens"])
+    inference_status = payload.get("inference_status")
+    if isinstance(inference_status, dict) and "tokens_input" in inference_status:
+        usage.setdefault("input_tokens", inference_status["tokens_input"])
     usage.setdefault("pair_count", len(documents))
     return RerankCallResult([float(score) for score in scores], usage)
 

@@ -45,6 +45,12 @@ retention_days = 90
 input_price_per_1m_tokens_microusd = 100000
 output_price_per_1m_tokens_microusd = 300000
 
+[audit.pricing.openrouter."Qwen/Qwen3-Embedding-8B"]
+input_price_per_1m_tokens_microusd = 10000
+
+[audit.pricing.deepinfra."Qwen/Qwen3-Reranker-8B"]
+input_price_per_1m_tokens_microusd = 50000
+
 [models.rewrite]
 model = "deepseek-v4-flash"
 url = "https://api.deepseek.com/chat/completions"

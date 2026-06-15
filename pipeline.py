@@ -1284,6 +1284,23 @@ def list_problems(
     return {"total": total, "items": [row_to_dict(row) for row in rows]}
 
 
+def get_problem(settings: Settings, problem_key: str) -> dict[str, Any] | None:
+    with db_connection(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT
+              p.key, p.source_key, p.title, p.url, p.text_key,
+              p.enabled, p.deleted, p.updated_at,
+              a.text
+            FROM problems p
+            JOIN artifacts a ON a.key = p.text_key AND a.kind = 'problem_text'
+            WHERE p.key = ?
+            """,
+            (problem_key,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def patch_problem(settings: Settings, problem_key: str, changes: dict[str, Any]) -> dict[str, Any]:
     allowed = {"title", "url", "enabled", "deleted"}
     assignments: list[str] = []
