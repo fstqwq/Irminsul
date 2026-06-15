@@ -291,7 +291,7 @@ POST /api/search → 检查 switching/索引可用
   → DeepSeek rewrite query 为 4 view
   → Qwen embedding 4 个 query vector（L2 normalized）
   → all_query_best_doc_top50_union 召回
-  → 按 embedding_score 截断到 rerank_top_k
+  → rerank_top_k=0 时保留全部 top_retrieval；rerank_top_k>0 时按 embedding_score 截断到 topK
   → Qwen reranker
   → calibrated_floor fusion
   → NDJSON stream 返回
@@ -312,7 +312,7 @@ score[i] = max(cosine(doc_view[i], q) for q in [q_clean, q_statement, q_abstract
 
 ### 4.4 Rerank & Fusion
 
-Rerank pair：`query.abstract_zh` vs `candidate.clean + "\n\n" + candidate.statement`。默认 `rerank_top_k=50`。
+Rerank pair：`query.abstract_zh` vs `candidate.clean + "\n\n" + candidate.statement`。默认 `rerank_top_k=0`，表示对全部 top_retrieval candidates rerank；正数 topK 表示仅保留该 topK 进入 rerank/fusion。
 
 Calibrated floor fusion：
 
@@ -452,7 +452,7 @@ embedding_batch_size = 128
 
 [search]
 top_per_doc_view = 50
-rerank_top_k = 50
+rerank_top_k = 0
 beta = 0.75
 rerank_range_floor = 0.1
 embedding_range_floor = 0.05

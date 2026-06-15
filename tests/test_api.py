@@ -4,6 +4,7 @@ import json
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -166,6 +167,85 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
     assert json.loads(audit["cost"])["microusd"] == 70
     rewrite_call = json.loads(audit["api_calls"])[0]
     assert rewrite_call["pricing"]["input_price_per_1m_tokens_microusd"] == 100000
+
+
+def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch, tmp_path: Path) -> None:
+    import search as search_module
+
+    base_settings = get_settings()
+    storage = replace(
+        base_settings.storage,
+        db_path=tmp_path / "app.sqlite3",
+        upload_dir=tmp_path / "uploads",
+        index_cache_dir=tmp_path / "index_cache",
+    )
+    test_settings = with_admin_credentials(
+        replace(
+            base_settings,
+            storage=storage,
+            search=replace(
+                base_settings.search,
+                top_per_doc_view=3,
+                top_retrieval=3,
+                rerank_top_k=2,
+            ),
+        ),
+        tmp_path,
+    )
+    ensure_database(test_settings)
+    loaded_index = search_module.LoadedIndex(
+        key="i:test",
+        problem_keys=["d_1", "d_2", "d_3"],
+        titles=["One", "Two", "Three"],
+        urls=["", "", ""],
+        texts={
+            "clean": ["original 1", "original 2", "original 3"],
+            "statement": ["statement 1", "statement 2", "statement 3"],
+            "abstract": ["abstract 1", "abstract 2", "abstract 3"],
+            "abstract_zh": ["abstract zh 1", "abstract zh 2", "abstract zh 3"],
+        },
+        matrices={
+            view: np.array([[0.9, 0.0], [0.8, 0.0], [0.7, 0.0]], dtype=np.float32)
+            for view in search_module.VIEWS
+        },
+        load_mode="ram",
+    )
+
+    def fake_embed(*args, **kwargs):
+        texts = args[1]
+        return search_module.EmbeddingCallResult(
+            np.array([[1.0, 0.0]] * len(texts), dtype=np.float32),
+            {"input_count": len(texts)},
+        )
+
+    def fake_rerank(*args, **kwargs):
+        documents = args[2]
+        assert len(documents) == 2
+        return search_module.RerankCallResult([0.4, 0.9], {"pair_count": len(documents)})
+
+    monkeypatch.setattr(search_module, "embed_texts_with_usage", fake_embed)
+    monkeypatch.setattr(search_module, "rerank_documents_with_usage", fake_rerank)
+
+    events = [
+        json.loads(line)
+        for line in search_module.search_events_loaded(
+            SimpleNamespace(
+                query_text="hello",
+                use_rewrite=False,
+                use_rerank=True,
+                edited_statement="",
+                edited_abstract="",
+                alpha=0.5,
+                beta=0.75,
+            ),
+            test_settings,
+            loaded_index,
+        )
+    ]
+    candidates = [event for event in events if event["type"] == "candidates"][0]["candidates"]
+
+    assert [candidate["problem_id"] for candidate in candidates] == ["d_2", "d_1"]
+    assert all(candidate["rerank_score"] is not None for candidate in candidates)
 
 
 def test_search_requires_active_index(monkeypatch) -> None:

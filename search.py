@@ -417,6 +417,12 @@ def rerank_documents(
     return rerank_documents_with_usage(model_config, query, documents, timeout).scores
 
 
+def rerank_candidate_window(candidates: list[Candidate], rerank_top_k: int) -> list[Candidate]:
+    if rerank_top_k <= 0:
+        return candidates
+    return candidates[:rerank_top_k]
+
+
 def fuse_scores(
     candidates: list[Candidate],
     beta: float,
@@ -721,7 +727,7 @@ def search_events_loaded(
         )
 
         if request.use_rerank:
-            rerank_candidates = candidates[: search_config.rerank_top_k]
+            rerank_candidates = rerank_candidate_window(candidates, search_config.rerank_top_k)
             yield _stage("rerank", "active", detail=f"{len(rerank_candidates)} candidates")
             rerank_start = perf_counter()
             rerank_call = rerank_documents_with_usage(
@@ -746,7 +752,7 @@ def search_events_loaded(
                 candidate.problem_id: replace(candidate, rerank_score=score)
                 for candidate, score in zip(rerank_candidates, scores, strict=True)
             }
-            candidates = [reranked.get(candidate.problem_id, candidate) for candidate in candidates]
+            candidates = [reranked[candidate.problem_id] for candidate in rerank_candidates]
             rerank_elapsed = perf_counter() - rerank_start
             timings["rerank"] = rerank_elapsed
             yield _stage("rerank", "done", elapsed=rerank_elapsed)

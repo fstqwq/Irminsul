@@ -3,7 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from core import ModelConfig, connect_db, get_settings, migrate
-from search import Candidate, VIEWS, extract_title, fuse_scores, rerank_documents_with_usage
+from search import (
+    Candidate,
+    VIEWS,
+    extract_title,
+    fuse_scores,
+    rerank_candidate_window,
+    rerank_documents_with_usage,
+)
 
 
 def test_settings_load() -> None:
@@ -47,6 +54,27 @@ def test_fuse_scores() -> None:
     assert [candidate.problem_id for candidate in fused] == ["a", "b"]
     assert fused[0].final_score is not None
     assert fused[0].final_score > fused[1].final_score
+
+
+def test_rerank_candidate_window_zero_means_all() -> None:
+    candidates = [
+        Candidate("a", "A", "", "", "s", "a", 0.9),
+        Candidate("b", "B", "", "", "s", "a", 0.8),
+        Candidate("c", "C", "", "", "s", "a", 0.7),
+    ]
+
+    assert rerank_candidate_window(candidates, 0) == candidates
+    assert rerank_candidate_window(candidates, -1) == candidates
+
+
+def test_rerank_candidate_window_positive_truncates() -> None:
+    candidates = [
+        Candidate("a", "A", "", "", "s", "a", 0.9),
+        Candidate("b", "B", "", "", "s", "a", 0.8),
+        Candidate("c", "C", "", "", "s", "a", 0.7),
+    ]
+
+    assert [candidate.problem_id for candidate in rerank_candidate_window(candidates, 2)] == ["a", "b"]
 
 
 def test_reranker_usage_reads_deepinfra_top_level_tokens(monkeypatch) -> None:

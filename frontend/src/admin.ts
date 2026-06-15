@@ -101,7 +101,7 @@ const settingsKeyLabels: Record<string, string> = {
   top_per_doc_view: "Candidates per view",
   top_retrieval: "Retrieved candidates",
   top_display: "Displayed results",
-  rerank_top_k: "Rerank candidates",
+  rerank_top_k: "Rerank candidates (0 = all)",
   alpha: "Alpha",
   beta: "Beta (rerank weight)",
   default_rerank: "Rerank by default",
