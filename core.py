@@ -261,7 +261,7 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
             ),
         ),
         audit=AuditConfig(
-            retention_days=int(audit.get("retention_days", 90)),
+            retention_days=int(audit.get("retention_days", 9999)),
             pricing=(
                 dict(audit.get("pricing", {}))
                 if isinstance(audit.get("pricing", {}), dict)

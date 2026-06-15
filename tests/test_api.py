@@ -57,8 +57,10 @@ def test_health_and_config() -> None:
         "embedding_shape",
         "views",
         "switching",
+        "source_counts",
     }
     assert health.json()["problem_count"] >= 0
+    assert isinstance(health.json()["source_counts"], list)
     assert config.status_code == 200
     assert config.json()["top_display"] == 20
 
@@ -655,6 +657,7 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
         assert health.status_code == 200
         assert health.json()["loaded_index_key"] == index_key
         assert health.json()["problem_count"] == 1
+        assert health.json()["source_counts"] == [{"source": "CF", "count": 1}]
 
 
 def test_startup_active_index_cache_failure_degrades(tmp_path: Path) -> None:

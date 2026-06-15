@@ -397,6 +397,11 @@ def create_app() -> FastAPI:
     def health() -> dict[str, Any]:
         state = index_state()
         active_index = state.current
+        source_counts: dict[str, int] = {}
+        if active_index:
+            for problem_key in active_index.problem_keys:
+                source = problem_key.split("/", 1)[0] if "/" in problem_key else problem_key
+                source_counts[source] = source_counts.get(source, 0) + 1
         return {
             "ok": True,
             "loaded_index_key": active_index.key if active_index else None,
@@ -404,6 +409,13 @@ def create_app() -> FastAPI:
             "embedding_shape": active_index.embedding_shape if active_index else None,
             "views": list(active_index.texts.keys()) if active_index else ["statement", "abstract"],
             "switching": state.switching,
+            "source_counts": [
+                {"source": source, "count": count}
+                for source, count in sorted(
+                    source_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ],
         }
 
     @app.get("/api/config")

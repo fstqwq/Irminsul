@@ -21,6 +21,7 @@ def test_settings_load() -> None:
     settings = get_settings()
 
     assert settings.storage.db_path.name == "app.sqlite3"
+    assert settings.audit.retention_days == 9999
     assert settings.search.top_per_doc_view == 50
     assert VIEWS == ("clean", "statement", "abstract", "abstract_zh")
     assert (

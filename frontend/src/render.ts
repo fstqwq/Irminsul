@@ -245,9 +245,27 @@ function renderResults(state: AppState): string {
 
 function renderFooter(state: AppState): string {
   if (typeof state.activeProblemCount !== "number") return "";
+  const hasSourceCounts = state.sourceCounts.length > 0;
   return `
     <footer class="app-footer">
-      Active index: <span>${state.activeProblemCount.toLocaleString()}</span> problems
+      <div>
+        Active index: <span>${state.activeProblemCount.toLocaleString()}</span> problems${
+          hasSourceCounts ? ` <a id="sourceCountsToggle" href="#sourceCountsPopover">(view)</a>` : ""
+        }
+      </div>
+      ${hasSourceCounts ? `
+        <div id="sourceCountsPopover" class="settings-panel" popover>
+          ${state.sourceCounts
+            .map(
+              (item) => `
+                <div class="switch-row">
+                  <span>${escapeHtml(item.source)}</span>
+                  <span>${item.count.toLocaleString()}</span>
+                </div>`
+            )
+            .join("")}
+        </div>` : ""}
+      <div>Your input will be retained for audition.</div>
     </footer>`;
 }
 
@@ -363,6 +381,11 @@ function bind(root: HTMLElement, actions: Actions): void {
   });
 
   root.querySelector<HTMLButtonElement>("#settingsToggle")?.addEventListener("click", actions.toggleSettings);
+  root.querySelector<HTMLAnchorElement>("#sourceCountsToggle")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    const popover = root.querySelector<HTMLElement>("#sourceCountsPopover");
+    popover?.togglePopover();
+  });
   root.querySelector<HTMLInputElement>("#useRewrite")?.addEventListener("change", (event) => {
     actions.setUseRewrite((event.currentTarget as HTMLInputElement).checked);
   });

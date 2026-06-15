@@ -586,16 +586,29 @@ button {
 }
 
 .app-footer {
+  position: relative;
   margin-top: 28px;
   padding-top: 14px;
   border-top: 1px solid var(--line-soft);
   color: var(--faint);
   font-size: 13px;
   line-height: 20px;
+  text-align: center;
 }
 
 .app-footer span {
   color: var(--muted);
+}
+
+.app-footer a {
+  color: rgba(76, 86, 197, 0.66);
+  text-decoration: none;
+  text-underline-offset: 3px;
+}
+
+.app-footer a:hover {
+  color: var(--accent-dark);
+  text-decoration: underline;
 }
 
 /* Results */

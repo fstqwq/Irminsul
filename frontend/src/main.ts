@@ -202,6 +202,7 @@ fetchConfig()
 fetchHealth()
   .then((health) => {
     state.activeProblemCount = health.problem_count;
+    state.sourceCounts = health.source_counts || [];
     render();
   })
   .catch(() => {

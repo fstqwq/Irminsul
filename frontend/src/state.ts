@@ -24,6 +24,12 @@ export type Health = {
   embedding_shape: [number, number] | null;
   views: string[];
   switching: boolean;
+  source_counts: SourceCount[];
+};
+
+export type SourceCount = {
+  source: string;
+  count: number;
 };
 
 export type Cost = {
@@ -55,6 +61,7 @@ export type Candidate = {
 export type AppState = {
   config: Config;
   activeProblemCount: number | null;
+  sourceCounts: SourceCount[];
   queryText: string;
   useRewrite: boolean;
   useRerank: boolean;
@@ -139,6 +146,7 @@ export function createInitialState(): AppState {
   return {
     config: defaultConfig,
     activeProblemCount: null,
+    sourceCounts: [],
     queryText: sampleQuery,
     useRewrite: true,
     useRerank: defaultConfig.default_rerank,

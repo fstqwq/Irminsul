@@ -38,7 +38,7 @@ load_mode = "mmap"
 activation_drain_timeout_seconds = 30
 
 [audit]
-retention_days = 90
+retention_days = 9999
 
 [audit.pricing.deepseek."deepseek-v4-flash"]
 input_price_per_1m_tokens_microusd = 100000
