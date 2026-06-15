@@ -35,9 +35,10 @@ class Candidate:
     problem_id: str
     title: str
     url: str
-    original_text: str
+    clean: str
     statement: str
     abstract: str
+    abstract_zh: str
     embedding_score: float
     rerank_score: float | None = None
     final_score: float | None = None
@@ -600,9 +601,10 @@ def retrieve_loaded_index(
                 problem_id=loaded_index.problem_keys[problem_ord],
                 title=loaded_index.titles[problem_ord],
                 url=loaded_index.urls[problem_ord],
-                original_text=loaded_index.texts["clean"][problem_ord],
+                clean=loaded_index.texts["clean"][problem_ord],
                 statement=loaded_index.texts["statement"][problem_ord],
                 abstract=loaded_index.texts["abstract"][problem_ord],
+                abstract_zh=loaded_index.texts["abstract_zh"][problem_ord],
                 embedding_score=score,
             )
         )
@@ -638,8 +640,10 @@ def search_events_loaded(
             yield _stage("rewrite", "done", detail="edited")
             yield ndjson_event(
                 "rewrite",
+                clean=rewrite.clean,
                 statement=rewrite.statement,
                 abstract=rewrite.abstract,
+                abstract_zh=rewrite.abstract_zh,
                 raw="",
                 edited=True,
             )
@@ -665,8 +669,10 @@ def search_events_loaded(
             yield _stage("rewrite", "done", elapsed=elapsed)
             yield ndjson_event(
                 "rewrite",
+                clean=rewrite.clean,
                 statement=rewrite.statement,
                 abstract=rewrite.abstract,
+                abstract_zh=rewrite.abstract_zh,
                 raw=rewrite.raw,
                 edited=False,
             )
@@ -734,7 +740,7 @@ def search_events_loaded(
                 settings.rerank_model,
                 views["abstract_zh"],
                 [
-                    f"{candidate.original_text}\n\n{candidate.statement}"
+                    f"{candidate.clean}\n\n{candidate.statement}"
                     for candidate in rerank_candidates
                 ],
                 timeout=settings.request_timeout,
@@ -766,6 +772,7 @@ def search_events_loaded(
             search_config.rerank_range_floor,
             search_config.embedding_range_floor,
         )
+        cost = _total_cost(api_calls)
         result_summary = _audit_result_summary(fused)
         write_search_audit(
             settings=settings,
@@ -778,13 +785,14 @@ def search_events_loaded(
             timings=timings,
             api_calls=api_calls,
             result=result_summary,
-            cost=_total_cost(api_calls),
+            cost=cost,
             error=None,
         )
         yield ndjson_event(
             "candidates",
             candidates=[asdict(candidate) for candidate in fused],
             timings=timings,
+            cost=cost,
         )
         yield ndjson_event("done")
     except Exception as exc:

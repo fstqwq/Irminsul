@@ -1,6 +1,7 @@
 export type StageName = "rewrite" | "embed" | "search" | "rerank";
 export type StageState = "idle" | "active" | "done" | "skip" | "error";
 export type SortMode = "combined" | "embedding" | "rerank";
+export type ResultView = "clean" | "statement" | "abstract" | "abstract_zh";
 
 export type Stage = {
   name: StageName;
@@ -12,14 +13,28 @@ export type Stage = {
 export type Config = {
   top_retrieval: number;
   top_display: number;
-  default_alpha: number;
   default_beta: number;
   default_rerank: boolean;
 };
 
+export type Health = {
+  ok: boolean;
+  loaded_index_key: string | null;
+  problem_count: number;
+  embedding_shape: [number, number] | null;
+  views: string[];
+  switching: boolean;
+};
+
+export type Cost = {
+  microusd: number;
+};
+
 export type RewritePayload = {
+  clean: string;
   statement: string;
   abstract: string;
+  abstract_zh: string;
   raw: string;
   edited?: boolean;
 };
@@ -28,9 +43,10 @@ export type Candidate = {
   problem_id: string;
   title: string;
   url: string;
-  original_text: string;
+  clean: string;
   statement: string;
   abstract: string;
+  abstract_zh: string;
   embedding_score: number;
   rerank_score: number | null;
   final_score: number | null;
@@ -38,11 +54,12 @@ export type Candidate = {
 
 export type AppState = {
   config: Config;
+  activeProblemCount: number | null;
   queryText: string;
   useRewrite: boolean;
   useRerank: boolean;
-  alpha: number;
   sortMode: SortMode;
+  resultView: ResultView;
   settingsOpen: boolean;
   rewriteOpen: boolean;
   rewrite: RewritePayload | null;
@@ -50,10 +67,10 @@ export type AppState = {
   editAbstract: string;
   stages: Record<StageName, Stage>;
   candidates: Candidate[];
+  cost: Cost | null;
   error: string;
   isRunning: boolean;
   hasSearched: boolean;
-  expanded: Set<string>;
 };
 
 export const stageOrder: StageName[] = ["rewrite", "embed", "search", "rerank"];
@@ -71,15 +88,44 @@ export const sortLabels: Record<SortMode, string> = {
   rerank: "Rerank"
 };
 
+export const resultViewLabels: Record<ResultView, string> = {
+  clean: "Filtered",
+  statement: "Statement",
+  abstract: "Abstract",
+  abstract_zh: "中文"
+};
+
 export const defaultConfig: Config = {
   top_retrieval: 200,
   top_display: 20,
-  default_alpha: 0.5,
   default_beta: 0.75,
   default_rerank: true
 };
 
 export const sampleQuery = "Given a bipartite graph, find the maximum matching.";
+
+const resultViewStorageKey = "yuantiji.resultView";
+
+export function loadResultView(): ResultView {
+  let value: string | null = null;
+  try {
+    value = window.localStorage?.getItem(resultViewStorageKey) || null;
+  } catch {
+    value = null;
+  }
+  if (value === "clean" || value === "statement" || value === "abstract" || value === "abstract_zh") {
+    return value;
+  }
+  return "statement";
+}
+
+export function saveResultView(value: ResultView): void {
+  try {
+    window.localStorage?.setItem(resultViewStorageKey, value);
+  } catch {
+    return;
+  }
+}
 
 export function initialStages(): Record<StageName, Stage> {
   return {
@@ -93,11 +139,12 @@ export function initialStages(): Record<StageName, Stage> {
 export function createInitialState(): AppState {
   return {
     config: defaultConfig,
+    activeProblemCount: null,
     queryText: sampleQuery,
     useRewrite: true,
     useRerank: defaultConfig.default_rerank,
-    alpha: defaultConfig.default_alpha,
     sortMode: "combined",
+    resultView: loadResultView(),
     settingsOpen: false,
     rewriteOpen: false,
     rewrite: null,
@@ -105,10 +152,10 @@ export function createInitialState(): AppState {
     editAbstract: "",
     stages: initialStages(),
     candidates: [],
+    cost: null,
     error: "",
     isRunning: false,
-    hasSearched: false,
-    expanded: new Set<string>()
+    hasSearched: false
   };
 }
 

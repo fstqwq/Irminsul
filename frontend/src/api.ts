@@ -1,11 +1,11 @@
-import type { Candidate, Config, RewritePayload, Stage } from "./state";
+import type { Candidate, Config, Cost, Health, RewritePayload, Stage } from "./state";
 
 export type Timings = Partial<Record<Stage["name"], number | string>>;
 
 export type StreamEvent =
   | ({ type: "stage" } & Stage)
   | ({ type: "rewrite" } & RewritePayload)
-  | { type: "candidates"; candidates: Candidate[]; timings: Timings }
+  | { type: "candidates"; candidates: Candidate[]; timings: Timings; cost?: Cost }
   | { type: "error"; message: string }
   | { type: "done" };
 
@@ -13,7 +13,6 @@ export type SearchRequest = {
   query_text: string;
   use_rewrite: boolean;
   use_rerank: boolean;
-  alpha: number;
   beta: number;
   edited_statement?: string;
   edited_abstract?: string;
@@ -23,6 +22,12 @@ export async function fetchConfig(): Promise<Config> {
   const response = await fetch("/api/config");
   if (!response.ok) throw new Error(`Config failed (${response.status})`);
   return response.json() as Promise<Config>;
+}
+
+export async function fetchHealth(): Promise<Health> {
+  const response = await fetch("/api/health");
+  if (!response.ok) throw new Error(`Health failed (${response.status})`);
+  return response.json() as Promise<Health>;
 }
 
 export async function streamSearch(

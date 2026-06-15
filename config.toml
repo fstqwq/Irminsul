@@ -26,7 +26,6 @@ top_per_doc_view = 50
 top_retrieval = 200
 top_display = 20
 rerank_top_k = 0
-alpha = 0.50
 beta = 0.75
 default_rerank = true
 rerank_range_floor = 0.1

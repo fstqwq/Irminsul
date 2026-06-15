@@ -4,9 +4,11 @@ import { installMathCopy } from "./copy";
 import {
   AppState,
   Candidate,
+  ResultView,
   SortMode,
   candidateScore,
   hasRerankScores,
+  resultViewLabels,
   sortedCandidates,
   sortLabels,
   stageLabels,
@@ -19,13 +21,12 @@ export type Actions = {
   toggleSettings(): void;
   setUseRewrite(value: boolean): void;
   setUseRerank(value: boolean): void;
-  setAlpha(value: number): void;
   setSortMode(value: SortMode): void;
+  setResultView(value: ResultView): void;
   toggleRewrite(): void;
   setEditStatement(value: string): void;
   setEditAbstract(value: string): void;
   resubmitRewrite(): void;
-  toggleResult(id: string): void;
 };
 
 function formatElapsed(value?: number): string {
@@ -70,6 +71,16 @@ function sourceLabel(candidate: Candidate): string {
 
 function formatScore(value: number): string {
   return Number.isFinite(value) ? value.toFixed(3) : "off";
+}
+
+function formatCost(state: AppState): string {
+  const microusd = state.cost?.microusd;
+  if (typeof microusd !== "number" || !Number.isFinite(microusd)) return "";
+  const usd = microusd / 1_000_000;
+  if (state.resultView === "abstract_zh") {
+    return `￥${(usd * 7).toFixed(6)}`;
+  }
+  return `$${usd.toFixed(6)}`;
 }
 
 function scorePercent(value: number): string {
@@ -124,10 +135,6 @@ function renderSettings(state: AppState): string {
       <label class="switch-row">
         <span>Rerank</span>
         <input id="useRerank" type="checkbox" ${state.useRerank ? "checked" : ""}>
-      </label>
-      <label class="range-row">
-        <span>Alpha <b>${state.alpha.toFixed(2)}</b></span>
-        <input id="alphaInput" type="range" min="0" max="1" step="0.05" value="${state.alpha}">
       </label>
     </div>`;
 }
@@ -186,17 +193,36 @@ function renderToolbar(state: AppState): string {
   const total = state.candidates.length;
   const shown = Math.min(state.config.top_display, total);
   const rerankReady = hasRerankScores(state.candidates);
+  const cost = formatCost(state);
   return `
     <section class="result-toolbar" aria-label="Result controls">
-      <div class="result-count"><b>${shown}</b> / ${total} results</div>
-      <div class="sort-segment" role="radiogroup" aria-label="Sort">
-        <span>Sort</span>
-        ${(["combined", "embedding", "rerank"] as SortMode[])
-          .map((mode) => {
-            const disabled = mode === "rerank" && !rerankReady;
-            return `<button class="${state.sortMode === mode ? "on" : ""}" data-sort="${mode}" role="radio" aria-checked="${state.sortMode === mode ? "true" : "false"}" type="button" ${disabled ? "disabled" : ""}>${sortLabels[mode]}</button>`;
-          })
-          .join("")}
+      <div class="result-count">
+        <span><b>${shown}</b> / ${total} results</span>
+        ${cost ? `<span class="result-cost" title="Estimated request cost">${escapeHtml(cost)}</span>` : ""}
+      </div>
+      <div class="toolbar-controls">
+        <label class="toolbar-select">
+          <span>Sort</span>
+          <select id="sortSelect" aria-label="Sort">
+            ${(["combined", "embedding", "rerank"] as SortMode[])
+              .map((mode) => {
+                const disabled = mode === "rerank" && !rerankReady;
+                return `<option value="${mode}" ${state.sortMode === mode ? "selected" : ""} ${disabled ? "disabled" : ""}>${sortLabels[mode]}</option>`;
+              })
+              .join("")}
+          </select>
+        </label>
+        <label class="toolbar-select">
+          <span>View</span>
+          <select id="resultViewSelect" aria-label="Result view">
+            ${(["clean", "statement", "abstract", "abstract_zh"] as ResultView[])
+              .map(
+                (view) =>
+                  `<option value="${view}" ${state.resultView === view ? "selected" : ""}>${resultViewLabels[view]}</option>`
+              )
+              .join("")}
+          </select>
+        </label>
       </div>
     </section>`;
 }
@@ -219,6 +245,14 @@ function renderResults(state: AppState): string {
     <section class="results" aria-label="Search results">
       ${candidates.map((candidate) => renderResultRow(candidate, state)).join("")}
     </section>`;
+}
+
+function renderFooter(state: AppState): string {
+  if (typeof state.activeProblemCount !== "number") return "";
+  return `
+    <footer class="app-footer">
+      Active index: <span>${state.activeProblemCount.toLocaleString()}</span> problems
+    </footer>`;
 }
 
 function renderSkeleton(): string {
@@ -245,24 +279,22 @@ function renderSkeleton(): string {
 
 function renderResultRow(candidate: Candidate, state: AppState): string {
   const id = escapeHtml(candidate.problem_id);
-  const expanded = state.expanded.has(candidate.problem_id);
   const title = escapeHtml(candidate.title || candidate.problem_id);
   const source = escapeHtml(sourceLabel(candidate));
   const score = candidateScore(candidate, state.sortMode, state.config.default_beta);
   const scoreText = formatScore(score);
-  const statement = renderMathText(candidate.statement || candidate.original_text);
-  const abstract = candidate.abstract ? renderMathText(candidate.abstract) : "";
+  const viewText = candidate[state.resultView] || candidate.statement || candidate.clean;
+  const statement = renderMathText(viewText);
   const titleLink = candidate.url
     ? `<a class="result-title" href="${escapeHtml(candidate.url)}" target="_blank" rel="noreferrer">${title}</a>`
     : `<span class="result-title">${title}</span>`;
   const sourceLink = candidate.url
     ? `<a class="result-source" href="${escapeHtml(candidate.url)}" target="_blank" rel="noreferrer">${icon("external-link", "source-icon")}<span>${source}</span></a>`
     : `<span class="result-source">${source}</span>`;
-  const expandLabel = expanded ? "Collapse result" : "Expand result";
   const scoreBlock = renderScoreBlock(candidate, scoreText);
 
   return `
-    <article class="result-row ${expanded ? "open" : ""}" data-id="${id}">
+    <article class="result-row" data-id="${id}">
       <div class="result-main">
         <div class="result-content">
           <div class="title-line">
@@ -272,18 +304,10 @@ function renderResultRow(candidate: Candidate, state: AppState): string {
             </div>
             <div class="score-inline">${scoreBlock}</div>
           </div>
-          <div class="statement ${expanded ? "" : "clamped"}">${statement}</div>
-          ${
-            expanded && abstract
-              ? `<div class="abstract"><span class="abstract-label">Abstract</span><div class="abstract-body">${abstract}</div></div>`
-              : ""
-          }
+          <div class="statement clamped">${statement}</div>
         </div>
         ${scoreBlock}
       </div>
-      <button class="result-expand-strip" type="button" data-result-toggle="${id}" aria-expanded="${expanded ? "true" : "false"}" aria-label="${expandLabel}" title="${expandLabel}">
-        ${icon(expanded ? "chevron-up" : "chevron-down")}
-      </button>
     </article>`;
 }
 
@@ -295,7 +319,7 @@ export function renderApp(root: HTMLElement, state: AppState, actions: Actions):
         <div class="topbar-inner">
           <div class="brand">
             <span class="brand-mark" aria-hidden="true"></span>
-            <span class="brand-name">Yuantiji</span>
+            <span class="brand-name">Irminsul</span>
           </div>
           <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings">${icon("settings")}</button>
           ${renderSettings(state)}
@@ -314,6 +338,7 @@ export function renderApp(root: HTMLElement, state: AppState, actions: Actions):
         ${renderToolbar(state)}
         ${renderResults(state)}
         ${renderEmpty(state)}
+        ${renderFooter(state)}
       </main>
     </div>`;
 
@@ -349,9 +374,6 @@ function bind(root: HTMLElement, actions: Actions): void {
   root.querySelector<HTMLInputElement>("#useRerank")?.addEventListener("change", (event) => {
     actions.setUseRerank((event.currentTarget as HTMLInputElement).checked);
   });
-  root.querySelector<HTMLInputElement>("#alphaInput")?.addEventListener("input", (event) => {
-    actions.setAlpha(Number((event.currentTarget as HTMLInputElement).value));
-  });
 
   root.querySelector<HTMLButtonElement>("#rewriteToggle")?.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -368,14 +390,12 @@ function bind(root: HTMLElement, actions: Actions): void {
   });
   root.querySelector<HTMLButtonElement>("#resubmitRewrite")?.addEventListener("click", actions.resubmitRewrite);
 
-  root.querySelectorAll<HTMLButtonElement>("[data-sort]").forEach((button) => {
-    button.addEventListener("click", () => actions.setSortMode(button.dataset.sort as SortMode));
+  root.querySelector<HTMLSelectElement>("#sortSelect")?.addEventListener("change", (event) => {
+    actions.setSortMode((event.currentTarget as HTMLSelectElement).value as SortMode);
   });
 
-  root.querySelectorAll<HTMLButtonElement>("[data-result-toggle]").forEach((button) => {
-    button.addEventListener("click", () => {
-      actions.toggleResult(button.dataset.resultToggle || "");
-    });
+  root.querySelector<HTMLSelectElement>("#resultViewSelect")?.addEventListener("change", (event) => {
+    actions.setResultView((event.currentTarget as HTMLSelectElement).value as ResultView);
   });
 }
 

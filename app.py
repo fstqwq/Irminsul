@@ -65,7 +65,6 @@ class SearchRequest(BaseModel):
     query_text: str = Field(min_length=1)
     use_rewrite: bool = True
     use_rerank: bool = True
-    alpha: float = Field(default=0.5, ge=0.0, le=1.0)
     beta: float = Field(default=0.75, ge=0.0, le=1.0)
     edited_statement: str | None = None
     edited_abstract: str | None = None
@@ -358,7 +357,7 @@ def create_app() -> FastAPI:
         finally:
             worker.stop()
 
-    app = FastAPI(title="Yuantiji", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Irminsul", version="0.2.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -386,7 +385,6 @@ def create_app() -> FastAPI:
         return {
             "top_retrieval": search_config.top_retrieval,
             "top_display": search_config.top_display,
-            "default_alpha": search_config.alpha,
             "default_beta": search_config.beta,
             "default_rerank": search_config.default_rerank,
         }

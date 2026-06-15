@@ -15,7 +15,7 @@ function handleCopy(event: ClipboardEvent): void {
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
 
   const range = selection.getRangeAt(0);
-  const scopes = selectedElements(activeRoot, range, ".statement, .abstract-body");
+  const scopes = selectedElements(activeRoot, range, ".statement");
   if (!scopes.length) return;
   if (!selectedElements(activeRoot, range, ".math-fragment").length) return;
 

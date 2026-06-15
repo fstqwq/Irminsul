@@ -72,7 +72,6 @@ class SearchConfig:
     top_display: int
     rerank_top_k: int
     beta: float
-    alpha: float
     default_rerank: bool
     rerank_range_floor: float
     embedding_range_floor: float
@@ -197,7 +196,6 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
             top_display=int(search.get("top_display", 20)),
             rerank_top_k=int(search.get("rerank_top_k", 0)),
             beta=float(search.get("beta", search.get("default_beta", 0.75))),
-            alpha=float(search.get("alpha", search.get("default_alpha", 0.5))),
             default_rerank=bool(search.get("default_rerank", True)),
             rerank_range_floor=float(search.get("rerank_range_floor", 0.1)),
             embedding_range_floor=float(search.get("embedding_range_floor", 0.05)),

@@ -45,8 +45,28 @@ def test_title_fallbacks() -> None:
 
 def test_fuse_scores() -> None:
     candidates = [
-        Candidate("a", "A", "", "", "s", "a", 0.2, 1.0),
-        Candidate("b", "B", "", "", "s", "a", 0.9, 0.0),
+        Candidate(
+            problem_id="a",
+            title="A",
+            url="",
+            clean="",
+            statement="s",
+            abstract="a",
+            abstract_zh="z",
+            embedding_score=0.2,
+            rerank_score=1.0,
+        ),
+        Candidate(
+            problem_id="b",
+            title="B",
+            url="",
+            clean="",
+            statement="s",
+            abstract="a",
+            abstract_zh="z",
+            embedding_score=0.9,
+            rerank_score=0.0,
+        ),
     ]
 
     fused = fuse_scores(candidates, beta=0.75)
@@ -58,9 +78,9 @@ def test_fuse_scores() -> None:
 
 def test_rerank_candidate_window_zero_means_all() -> None:
     candidates = [
-        Candidate("a", "A", "", "", "s", "a", 0.9),
-        Candidate("b", "B", "", "", "s", "a", 0.8),
-        Candidate("c", "C", "", "", "s", "a", 0.7),
+        Candidate("a", "A", "", "", "s", "a", "z", 0.9),
+        Candidate("b", "B", "", "", "s", "a", "z", 0.8),
+        Candidate("c", "C", "", "", "s", "a", "z", 0.7),
     ]
 
     assert rerank_candidate_window(candidates, 0) == candidates
@@ -69,9 +89,9 @@ def test_rerank_candidate_window_zero_means_all() -> None:
 
 def test_rerank_candidate_window_positive_truncates() -> None:
     candidates = [
-        Candidate("a", "A", "", "", "s", "a", 0.9),
-        Candidate("b", "B", "", "", "s", "a", 0.8),
-        Candidate("c", "C", "", "", "s", "a", 0.7),
+        Candidate("a", "A", "", "", "s", "a", "z", 0.9),
+        Candidate("b", "B", "", "", "s", "a", "z", 0.8),
+        Candidate("c", "C", "", "", "s", "a", "z", 0.7),
     ]
 
     assert [candidate.problem_id for candidate in rerank_candidate_window(candidates, 2)] == ["a", "b"]

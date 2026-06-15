@@ -137,7 +137,19 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         assert response.status_code == 200
         assert [event["type"] for event in events][-2:] == ["candidates", "done"]
         assert any(event["type"] == "rewrite" for event in events)
-        assert events[-2]["candidates"][0]["title"] == "Sample"
+        rewrite_event = [event for event in events if event["type"] == "rewrite"][0]
+        assert rewrite_event["clean"] == "rewritten clean"
+        assert rewrite_event["statement"] == "rewritten statement"
+        assert rewrite_event["abstract"] == "rewritten abstract"
+        assert rewrite_event["abstract_zh"] == "rewritten abstract zh"
+        candidate = events[-2]["candidates"][0]
+        assert events[-2]["cost"]["microusd"] == 70
+        assert candidate["title"] == "Sample"
+        assert candidate["clean"] == "original"
+        assert candidate["statement"] == "statement"
+        assert candidate["abstract"] == "abstract"
+        assert candidate["abstract_zh"] == "abstract zh"
+        assert {"clean", "statement", "abstract", "abstract_zh"}.issubset(candidate)
 
         login = client.post("/admin/api/auth/login", json={"password": "secret"})
         csrf = client.cookies.get("admin_csrf")
@@ -235,7 +247,6 @@ def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch,
                 use_rerank=True,
                 edited_statement="",
                 edited_abstract="",
-                alpha=0.5,
                 beta=0.75,
             ),
             test_settings,

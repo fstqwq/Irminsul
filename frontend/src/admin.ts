@@ -102,7 +102,6 @@ const settingsKeyLabels: Record<string, string> = {
   top_retrieval: "Retrieved candidates",
   top_display: "Displayed results",
   rerank_top_k: "Rerank candidates (0 = all)",
-  alpha: "Alpha",
   beta: "Beta (rerank weight)",
   default_rerank: "Rerank by default",
   rerank_range_floor: "Rerank range floor",
@@ -306,7 +305,7 @@ function render(): void {
   rootEl.innerHTML = `
     <div class="admin-app">
       <aside class="admin-side">
-        <div class="admin-brand">Yuantiji Admin</div>
+        <div class="admin-brand">Irminsul Admin</div>
         <nav>${pages.map(renderNavItem).join("")}</nav>
         <button class="admin-logout" id="adminLogout" type="button">Logout</button>
       </aside>
@@ -330,7 +329,7 @@ function renderLogin(): string {
   return `
     <main class="admin-login">
       <form id="adminLoginForm">
-        <h1>Yuantiji Admin</h1>
+        <h1>Irminsul Admin</h1>
         <label for="adminPassword">Password</label>
         <input id="adminPassword" type="password" autocomplete="current-password" autofocus>
         <button type="submit">Login</button>
