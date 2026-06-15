@@ -4,6 +4,7 @@ import json
 import os
 import gc
 import shutil
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -190,6 +191,75 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
     rebuilt = rebuild_index_cache(settings, index_key)
     assert rebuilt["status"] == "built"
     assert np.load(cache_path / "statement.npy", mmap_mode="r").shape == (1, 2)
+
+
+def test_build_index_rewrites_all_problems_before_embedding(monkeypatch, tmp_path: Path) -> None:
+    settings = _temp_settings(tmp_path)
+    ensure_database(settings)
+    now = utc_now()
+    problems = [
+        ("CF/1A", "First problem text."),
+        ("CF/2A", "Second problem text."),
+    ]
+
+    with db_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO sources(key, name, updated_at) VALUES ('CF', 'CF', ?)",
+                (now,),
+            )
+            for problem_key, text in problems:
+                problem_text_key = text_key(text)
+                conn.execute(
+                    """
+                    INSERT INTO artifacts(key, kind, text, status, updated_at)
+                    VALUES (?, 'problem_text', ?, 'succeeded', ?)
+                    """,
+                    (problem_text_key, text, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO problems(key, source_key, title, url, text_key, updated_at)
+                    VALUES (?, 'CF', ?, '', ?, ?)
+                    """,
+                    (problem_key, problem_key, problem_text_key, now),
+                )
+
+    lock = threading.Lock()
+    rewrite_calls = 0
+    embed_batches: list[int] = []
+
+    def fake_rewrite(*args, **kwargs) -> RewriteResult:
+        nonlocal rewrite_calls
+        with lock:
+            rewrite_calls += 1
+        return RewriteResult(
+            statement="Statement view",
+            abstract="Abstract view",
+            abstract_zh="Chinese abstract",
+            clean="Clean view",
+            raw="raw",
+        )
+
+    def fake_embed(*args, **kwargs) -> np.ndarray:
+        texts = args[1]
+        with lock:
+            assert rewrite_calls == len(problems)
+            embed_batches.append(len(texts))
+        return np.array(
+            [[1.0, float(index + 1)] for index in range(len(texts))],
+            dtype=np.float32,
+        )
+
+    monkeypatch.setattr("pipeline.rewrite_query", fake_rewrite)
+    monkeypatch.setattr("pipeline.embed_texts", fake_embed)
+
+    job = create_build_index_job(settings)
+    finished = execute_build_index_job(job["key"], settings)
+
+    assert finished["status"] == "succeeded"
+    assert rewrite_calls == len(problems)
+    assert embed_batches == [len(problems) * 4]
 
 
 def test_cleanup_removes_expired_operational_files(tmp_path: Path) -> None:

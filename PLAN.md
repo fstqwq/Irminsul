@@ -204,7 +204,7 @@ CREATE TABLE kv (
 
 **rewrite**（`ensure_rewrite`）：计算 rewrite_key → INSERT OR IGNORE pending → 已 succeeded 直接复用 → 否则调 DeepSeek → 解析四段 → 短事务写回。
 
-**embedding 批量**：收集 pending embedding artifacts → 按 `embedding_batch_size=16` 分批 → 标记 running → 事务外调 `embed_texts()` → L2 normalize → 逐条短事务写回 succeeded。
+**rewrite 并发 + embedding 批量**：先按 `rewrite_concurrency=16` 并发生成 pending rewrite artifacts；全部 rewrite 完成后，收集 pending embedding artifacts → 按 `embedding_batch_size=128` 分批 → 标记 running → 事务外调 `embed_texts()` → L2 normalize → 逐条短事务写回 succeeded。
 
 **失败处理**：单个 artifact 失败不影响其他；artifact 不记录重试次数。失败后由管理员在 job 层手动 retry。
 
@@ -447,7 +447,8 @@ field_max_text_chars = 200000
 
 [jobs]
 poll_seconds = 2
-embedding_batch_size = 16
+rewrite_concurrency = 16
+embedding_batch_size = 128
 
 [search]
 top_per_doc_view = 50

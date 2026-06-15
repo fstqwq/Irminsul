@@ -6,6 +6,7 @@ import uuid
 import shutil
 import gc
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -141,6 +142,14 @@ class ImportStats:
     overwrite: int = 0
     skip: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EmbeddingWorkItem:
+    rewrite_key: str
+    artifact_key: str
+    view: str
+    text: str
 
 
 def source_key_from_problem_id(problem_id: str) -> str:
@@ -579,87 +588,137 @@ def ensure_embedding_artifacts(
     selected_rewrite_key: str,
     selected_method_key: str | None = None,
 ) -> dict[str, dict[str, Any]]:
+    bulk = ensure_embedding_artifacts_bulk(settings, [selected_rewrite_key], selected_method_key)
+    return bulk[selected_rewrite_key]
+
+
+def ensure_embedding_artifacts_bulk(
+    settings: Settings,
+    selected_rewrite_keys: list[str],
+    selected_method_key: str | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
     selected_method_key = selected_method_key or embedding_method_key(settings)
+    artifacts, pending_items = _prepare_embedding_work(
+        settings,
+        selected_rewrite_keys,
+        selected_method_key,
+    )
+    _embed_pending_items(settings, pending_items)
+    if pending_items:
+        return _load_embedding_artifacts(settings, selected_rewrite_keys, selected_method_key)
+    return artifacts
+
+
+def _prepare_embedding_work(
+    settings: Settings,
+    selected_rewrite_keys: list[str],
+    selected_method_key: str,
+) -> tuple[dict[str, dict[str, dict[str, Any]]], list[EmbeddingWorkItem]]:
+    unique_rewrite_keys = list(dict.fromkeys(selected_rewrite_keys))
+    view_texts_by_rewrite: dict[str, dict[str, str]] = {}
+    now = utc_now()
+
     with db_connection(settings) as conn:
-        rewrite_row = conn.execute(
-            "SELECT data FROM artifacts WHERE key = ? AND kind = 'rewrite' AND status = 'succeeded'",
-            (selected_rewrite_key,),
-        ).fetchone()
-        if rewrite_row is None:
-            raise ValueError("succeeded rewrite artifact not found")
-        rewrite_data = json.loads(rewrite_row["data"])
-        view_texts = {view: str(rewrite_data.get(view) or "") for view in VIEWS}
-        if not all(view_texts.values()):
-            raise ValueError("rewrite artifact does not contain all views")
-
-        now = utc_now()
         with conn:
-            for view in VIEWS:
-                conn.execute(
+            for selected_rewrite_key in unique_rewrite_keys:
+                rewrite_row = conn.execute(
                     """
-                    INSERT OR IGNORE INTO artifacts(
-                      key, kind, parent_key, method_key, role, text, data, blob,
-                      status, error, updated_at
-                    )
-                    VALUES (?, 'embedding', ?, ?, ?, NULL, NULL, NULL,
-                            'pending', NULL, ?)
+                    SELECT data
+                    FROM artifacts
+                    WHERE key = ? AND kind = 'rewrite' AND status = 'succeeded'
                     """,
-                    (
-                        embedding_key(selected_rewrite_key, selected_method_key, view),
-                        selected_rewrite_key,
-                        selected_method_key,
-                        view,
-                        now,
-                    ),
+                    (selected_rewrite_key,),
+                ).fetchone()
+                if rewrite_row is None:
+                    raise ValueError(f"succeeded rewrite artifact not found: {selected_rewrite_key}")
+                rewrite_data = json.loads(rewrite_row["data"])
+                view_texts = {view: str(rewrite_data.get(view) or "") for view in VIEWS}
+                if not all(view_texts.values()):
+                    raise ValueError(f"rewrite artifact does not contain all views: {selected_rewrite_key}")
+                view_texts_by_rewrite[selected_rewrite_key] = view_texts
+                for view in VIEWS:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO artifacts(
+                          key, kind, parent_key, method_key, role, text, data, blob,
+                          status, error, updated_at
+                        )
+                        VALUES (?, 'embedding', ?, ?, ?, NULL, NULL, NULL,
+                                'pending', NULL, ?)
+                        """,
+                        (
+                            embedding_key(selected_rewrite_key, selected_method_key, view),
+                            selected_rewrite_key,
+                            selected_method_key,
+                            view,
+                            now,
+                        ),
+                    )
+
+        artifacts = _load_embedding_artifacts_from_conn(
+            conn,
+            unique_rewrite_keys,
+            selected_method_key,
+        )
+
+    pending_items: list[EmbeddingWorkItem] = []
+    for selected_rewrite_key in unique_rewrite_keys:
+        rewrite_artifacts = artifacts.get(selected_rewrite_key, {})
+        if set(rewrite_artifacts) != set(VIEWS):
+            raise ValueError(f"embedding artifacts are incomplete: {selected_rewrite_key}")
+        for view in VIEWS:
+            artifact = rewrite_artifacts[view]
+            if artifact["status"] != "succeeded":
+                pending_items.append(
+                    EmbeddingWorkItem(
+                        rewrite_key=selected_rewrite_key,
+                        artifact_key=artifact["key"],
+                        view=view,
+                        text=view_texts_by_rewrite[selected_rewrite_key][view],
+                    )
                 )
+    return artifacts, pending_items
 
-        artifacts = {
-            row["role"]: row_to_dict(row)
-            for row in conn.execute(
-                """
-                SELECT * FROM artifacts
-                WHERE kind = 'embedding'
-                  AND parent_key = ?
-                  AND method_key = ?
-                """,
-                (selected_rewrite_key, selected_method_key),
-            ).fetchall()
-        }
 
-    pending_views = [
-        view
-        for view in VIEWS
-        if artifacts[view]["status"] != "succeeded"
-    ]
-    if not pending_views:
-        return {view: artifacts[view] for view in VIEWS}
-
-    for start in range(0, len(pending_views), settings.jobs.embedding_batch_size):
-        batch_views = pending_views[start : start + settings.jobs.embedding_batch_size]
-        batch_keys = [
-            embedding_key(selected_rewrite_key, selected_method_key, view) for view in batch_views
-        ]
+def _embed_pending_items(settings: Settings, pending_items: list[EmbeddingWorkItem]) -> None:
+    batch_size = max(1, settings.jobs.embedding_batch_size)
+    for start in range(0, len(pending_items), batch_size):
+        batch = pending_items[start : start + batch_size]
+        batch_keys = [item.artifact_key for item in batch]
         _mark_artifacts_running(settings, batch_keys)
         try:
             vectors = embed_texts(
                 settings.embedding_model,
-                [view_texts[view] for view in batch_views],
+                [item.text for item in batch],
                 timeout=settings.request_timeout,
             )
             matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
-            _store_embedding_batch(
-                settings,
-                selected_rewrite_key,
-                selected_method_key,
-                batch_views,
-                matrix,
-            )
+            _store_embedding_items_batch(settings, batch, matrix)
         except Exception as exc:
             for key in batch_keys:
                 _mark_artifact_failed(settings, key, str(exc))
             raise
 
+
+def _load_embedding_artifacts(
+    settings: Settings,
+    selected_rewrite_keys: list[str],
+    selected_method_key: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    unique_rewrite_keys = list(dict.fromkeys(selected_rewrite_keys))
     with db_connection(settings) as conn:
+        return _load_embedding_artifacts_from_conn(conn, unique_rewrite_keys, selected_method_key)
+
+
+def _load_embedding_artifacts_from_conn(
+    conn: Any,
+    selected_rewrite_keys: list[str],
+    selected_method_key: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    artifacts: dict[str, dict[str, dict[str, Any]]] = {
+        selected_rewrite_key: {} for selected_rewrite_key in selected_rewrite_keys
+    }
+    for selected_rewrite_key in selected_rewrite_keys:
         rows = conn.execute(
             """
             SELECT * FROM artifacts
@@ -669,7 +728,8 @@ def ensure_embedding_artifacts(
             """,
             (selected_rewrite_key, selected_method_key),
         ).fetchall()
-    return {row["role"]: row_to_dict(row) for row in rows}
+        artifacts[selected_rewrite_key] = {row["role"]: row_to_dict(row) for row in rows}
+    return artifacts
 
 
 def get_artifact(settings: Settings, artifact_key: str) -> dict[str, Any] | None:
@@ -720,17 +780,15 @@ def _mark_artifacts_running(settings: Settings, artifact_keys: list[str]) -> Non
             )
 
 
-def _store_embedding_batch(
+def _store_embedding_items_batch(
     settings: Settings,
-    selected_rewrite_key: str,
-    selected_method_key: str,
-    views: list[str],
+    items: list[EmbeddingWorkItem],
     matrix: np.ndarray,
 ) -> None:
     now = utc_now()
     with db_connection(settings) as conn:
         with conn:
-            for view, vector in zip(views, matrix, strict=True):
+            for item, vector in zip(items, matrix, strict=True):
                 payload = {
                     "dim": int(vector.shape[0]),
                     "dtype": "float32",
@@ -748,7 +806,7 @@ def _store_embedding_batch(
                         json_dumps(payload),
                         np.asarray(vector, dtype=np.float32).tobytes(),
                         now,
-                        embedding_key(selected_rewrite_key, selected_method_key, view),
+                        item.artifact_key,
                     ),
                 )
 
@@ -794,6 +852,127 @@ def create_build_index_job(settings: Settings) -> dict[str, Any]:
     return job
 
 
+def _record_problem_failure(
+    failures: list[dict[str, Any]],
+    failed_problem_keys: set[str],
+    problem: dict[str, Any],
+    phase: str,
+    error: str,
+) -> None:
+    problem_key = str(problem["key"])
+    if problem_key in failed_problem_keys:
+        return
+    failures.append({"problem_key": problem_key, "phase": phase, "error": error})
+    failed_problem_keys.add(problem_key)
+
+
+def _group_snapshot_by_text_key(snapshot: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for problem in snapshot:
+        grouped.setdefault(str(problem["text_key"]), []).append(problem)
+    return grouped
+
+
+def _ensure_rewrites_for_snapshot(
+    settings: Settings,
+    job_key: str,
+    snapshot: list[dict[str, Any]],
+    selected_method_key: str,
+    failures: list[dict[str, Any]],
+    failed_problem_keys: set[str],
+) -> dict[str, dict[str, Any]]:
+    grouped = _group_snapshot_by_text_key(snapshot)
+    items = list(grouped.items())
+    rewrite_by_text_key: dict[str, dict[str, Any]] = {}
+    if not items:
+        return rewrite_by_text_key
+
+    max_workers = max(1, min(settings.jobs.rewrite_concurrency, len(items)))
+    append_job_log(
+        settings,
+        job_key,
+        "info",
+        "Rewrite phase started",
+        {"texts": len(items), "problems": len(snapshot), "concurrency": max_workers},
+    )
+    _update_job_progress(
+        settings,
+        job_key,
+        {"phase": "rewrite", "processed": 0, "total": len(snapshot), "failures": 0},
+    )
+
+    processed = 0
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yuantiji-rewrite") as pool:
+        futures = {
+            pool.submit(ensure_rewrite_artifact, settings, text_key, selected_method_key): text_key
+            for text_key, _ in items
+        }
+        for future in as_completed(futures):
+            text_key = futures[future]
+            problems = grouped[text_key]
+            try:
+                rewrite_by_text_key[text_key] = future.result()
+            except Exception as exc:
+                error = str(exc)
+                for problem in problems:
+                    _record_problem_failure(
+                        failures,
+                        failed_problem_keys,
+                        problem,
+                        "rewrite",
+                        error,
+                    )
+                append_job_log(
+                    settings,
+                    job_key,
+                    "error",
+                    "Rewrite failed",
+                    {
+                        "problem_keys": [problem["key"] for problem in problems],
+                        "error": error,
+                    },
+                )
+
+            processed += len(problems)
+            _update_job_progress(
+                settings,
+                job_key,
+                {
+                    "phase": "rewrite",
+                    "processed": processed,
+                    "total": len(snapshot),
+                    "failures": len(failures),
+                },
+                {"failures": failures} if failures else None,
+            )
+            if _cancel_requested(settings, job_key):
+                for pending in futures:
+                    pending.cancel()
+                break
+
+    return rewrite_by_text_key
+
+
+def _problem_count_for_rewrites(
+    rewrite_keys: set[str],
+    problems_by_rewrite_key: dict[str, list[dict[str, Any]]],
+) -> int:
+    return sum(len(problems_by_rewrite_key.get(rewrite_key, [])) for rewrite_key in rewrite_keys)
+
+
+def _problem_progress(
+    completed_rewrite_keys: set[str],
+    problems_by_rewrite_key: dict[str, list[dict[str, Any]]],
+    failed_problem_keys: set[str],
+    total: int,
+) -> int:
+    return min(
+        total,
+        _problem_count_for_rewrites(completed_rewrite_keys, problems_by_rewrite_key)
+        + len(failed_problem_keys),
+    )
+
+
 def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     with db_connection(settings) as conn:
         row = conn.execute(
@@ -815,7 +994,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                 SET status = 'running', progress = ?, result = NULL, error = NULL, updated_at = ?
                 WHERE key = ?
                 """,
-                (json_dumps({"phase": "artifacts"}), utc_now(), job_key),
+                (json_dumps({"phase": "rewrite"}), utc_now(), job_key),
             )
 
     snapshot = _read_snapshot(Path(payload["snapshot_path"]))
@@ -824,59 +1003,202 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     selected_embedding_method_key = str(payload["embedding_method_key"])
     prepared: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    failed_problem_keys: set[str] = set()
 
-    for position, problem in enumerate(snapshot, start=1):
+    rewrite_by_text_key = _ensure_rewrites_for_snapshot(
+        settings,
+        job_key,
+        snapshot,
+        selected_rewrite_method_key,
+        failures,
+        failed_problem_keys,
+    )
+    if canceled := _finish_if_cancel_requested(
+        settings,
+        job_key,
+        {"phase": "rewrite", "failures": failures, "processed": len(snapshot), "total": len(snapshot)},
+    ):
+        return canceled
+
+    if failures:
+        append_job_log(
+            settings,
+            job_key,
+            "warning",
+            "Build index blocked after rewrite",
+            {"failures": len(failures), "total": len(snapshot)},
+        )
+        return _finish_job(settings, job_key, "blocked", {"failures": failures}, None)
+
+    rewrite_keys = list(
+        dict.fromkeys(rewrite_by_text_key[problem["text_key"]]["key"] for problem in snapshot)
+    )
+    problems_by_rewrite_key: dict[str, list[dict[str, Any]]] = {}
+    for problem in snapshot:
+        rewrite_key_value = rewrite_by_text_key[problem["text_key"]]["key"]
+        problems_by_rewrite_key.setdefault(rewrite_key_value, []).append(problem)
+
+    embedding_artifacts, pending_items = _prepare_embedding_work(
+        settings,
+        rewrite_keys,
+        selected_embedding_method_key,
+    )
+    embedding_counts = {
+        rewrite_key_value: sum(
+            1
+            for artifact in artifacts.values()
+            if artifact["status"] == "succeeded"
+        )
+        for rewrite_key_value, artifacts in embedding_artifacts.items()
+    }
+    completed_rewrite_keys = {
+        rewrite_key_value
+        for rewrite_key_value, count in embedding_counts.items()
+        if count == len(VIEWS)
+    }
+    append_job_log(
+        settings,
+        job_key,
+        "info",
+        "Embedding phase started",
+        {
+            "pending_embeddings": len(pending_items),
+            "batch_size": max(1, settings.jobs.embedding_batch_size),
+        },
+    )
+    _update_job_progress(
+        settings,
+        job_key,
+        {
+            "phase": "embedding",
+            "processed": _problem_progress(
+                completed_rewrite_keys,
+                problems_by_rewrite_key,
+                failed_problem_keys,
+                len(snapshot),
+            ),
+            "total": len(snapshot),
+            "failures": 0,
+            "processed_embeddings": 0,
+            "total_embeddings": len(pending_items),
+        },
+    )
+
+    processed_embeddings = 0
+    batch_size = max(1, settings.jobs.embedding_batch_size)
+    for start in range(0, len(pending_items), batch_size):
         if canceled := _finish_if_cancel_requested(
             settings,
             job_key,
-            {"failures": failures, "processed": position - 1, "total": len(snapshot)},
+            {
+                "phase": "embedding",
+                "failures": failures,
+                "processed": _problem_progress(
+                    completed_rewrite_keys,
+                    problems_by_rewrite_key,
+                    failed_problem_keys,
+                    len(snapshot),
+                ),
+                "total": len(snapshot),
+                "processed_embeddings": processed_embeddings,
+                "total_embeddings": len(pending_items),
+            },
         ):
             return canceled
-        try:
-            rewrite = ensure_rewrite_artifact(
-                settings,
-                problem["text_key"],
-                selected_rewrite_method_key,
-            )
-            embeddings = ensure_embedding_artifacts(
-                settings,
-                rewrite["key"],
-                selected_embedding_method_key,
-            )
-            failed_embeddings = [
-                view for view, artifact in embeddings.items() if artifact["status"] != "succeeded"
-            ]
-            if failed_embeddings:
-                failure = {
-                    "problem_key": problem["key"],
-                    "error": f"embedding failed for views: {', '.join(failed_embeddings)}",
-                }
-                failures.append(failure)
-                append_job_log(settings, job_key, "error", "Embedding failed", failure)
-            else:
-                prepared.append({"problem": problem, "rewrite": rewrite, "embeddings": embeddings})
-        except Exception as exc:
-            if _cancel_requested(settings, job_key):
-                return _finish_if_cancel_requested(
-                    settings,
-                    job_key,
-                    {"failures": failures, "processed": position - 1, "total": len(snapshot)},
-                ) or _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
-            failure = {"problem_key": problem["key"], "error": str(exc)}
-            failures.append(failure)
-            append_job_log(settings, job_key, "error", "Artifact generation failed", failure)
 
+        batch = pending_items[start : start + batch_size]
+        batch_keys = [item.artifact_key for item in batch]
+        _mark_artifacts_running(settings, batch_keys)
+        try:
+            vectors = embed_texts(
+                settings.embedding_model,
+                [item.text for item in batch],
+                timeout=settings.request_timeout,
+            )
+            matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
+            _store_embedding_items_batch(settings, batch, matrix)
+            for item in batch:
+                embedding_counts[item.rewrite_key] = embedding_counts.get(item.rewrite_key, 0) + 1
+                if embedding_counts[item.rewrite_key] == len(VIEWS):
+                    completed_rewrite_keys.add(item.rewrite_key)
+        except Exception as exc:
+            error = str(exc)
+            for key in batch_keys:
+                _mark_artifact_failed(settings, key, error)
+            affected_rewrite_keys = sorted({item.rewrite_key for item in batch})
+            for rewrite_key_value in affected_rewrite_keys:
+                for problem in problems_by_rewrite_key.get(rewrite_key_value, []):
+                    _record_problem_failure(
+                        failures,
+                        failed_problem_keys,
+                        problem,
+                        "embedding",
+                        error,
+                    )
+            append_job_log(
+                settings,
+                job_key,
+                "error",
+                "Embedding batch failed",
+                {
+                    "rewrite_keys": affected_rewrite_keys,
+                    "artifacts": len(batch),
+                    "error": error,
+                },
+            )
+
+        processed_embeddings += len(batch)
         _update_job_progress(
             settings,
             job_key,
             {
-                "phase": "artifacts",
-                "processed": position,
+                "phase": "embedding",
+                "processed": _problem_progress(
+                    completed_rewrite_keys,
+                    problems_by_rewrite_key,
+                    failed_problem_keys,
+                    len(snapshot),
+                ),
                 "total": len(snapshot),
                 "failures": len(failures),
+                "processed_embeddings": processed_embeddings,
+                "total_embeddings": len(pending_items),
             },
             {"failures": failures} if failures else None,
         )
+
+    embedding_artifacts = _load_embedding_artifacts(
+        settings,
+        rewrite_keys,
+        selected_embedding_method_key,
+    )
+    for problem in snapshot:
+        rewrite = rewrite_by_text_key.get(problem["text_key"])
+        if rewrite is None:
+            _record_problem_failure(
+                failures,
+                failed_problem_keys,
+                problem,
+                "rewrite",
+                "rewrite artifact was not prepared",
+            )
+            continue
+        embeddings = embedding_artifacts.get(rewrite["key"], {})
+        failed_embeddings = [
+            view
+            for view in VIEWS
+            if embeddings.get(view, {}).get("status") != "succeeded"
+        ]
+        if failed_embeddings:
+            _record_problem_failure(
+                failures,
+                failed_problem_keys,
+                problem,
+                "embedding",
+                f"embedding failed for views: {', '.join(failed_embeddings)}",
+            )
+            continue
+        prepared.append({"problem": problem, "rewrite": rewrite, "embeddings": embeddings})
 
     if failures:
         append_job_log(

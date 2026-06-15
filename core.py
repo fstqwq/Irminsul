@@ -61,6 +61,7 @@ class LimitsConfig:
 @dataclass(frozen=True)
 class JobsConfig:
     poll_seconds: int
+    rewrite_concurrency: int
     embedding_batch_size: int
 
 
@@ -187,7 +188,8 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
         ),
         jobs=JobsConfig(
             poll_seconds=int(jobs.get("poll_seconds", 2)),
-            embedding_batch_size=int(jobs.get("embedding_batch_size", 16)),
+            rewrite_concurrency=int(jobs.get("rewrite_concurrency", 16)),
+            embedding_batch_size=int(jobs.get("embedding_batch_size", 128)),
         ),
         search=SearchConfig(
             top_per_doc_view=int(search.get("top_per_doc_view", 50)),
