@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -99,14 +99,16 @@ def index_state() -> IndexState:
 
 
 def _admin_secret(current_settings: Settings) -> str:
-    secret = os.environ.get(current_settings.admin.signing_secret_env, "").strip()
+    path = current_settings.admin.signing_secret_file
+    secret = path.read_text(encoding="utf-8-sig").strip() if path.exists() else ""
     if not secret:
         raise HTTPException(status_code=503, detail="Admin signing secret is not configured")
     return secret
 
 
 def _password_hash(current_settings: Settings) -> str:
-    password_hash = os.environ.get(current_settings.admin.password_hash_env, "").strip()
+    path = current_settings.admin.password_hash_file
+    password_hash = path.read_text(encoding="utf-8-sig").strip() if path.exists() else ""
     if not password_hash:
         raise HTTPException(status_code=503, detail="Admin password hash is not configured")
     return password_hash
@@ -169,7 +171,7 @@ def require_admin(request: Request) -> dict[str, Any]:
 
 
 def _set_session_cookies(response: Response, current_settings: Settings) -> None:
-    csrf = os.urandom(24).hex()
+    csrf = secrets.token_hex(24)
     expires_at = int(time.time()) + _session_seconds(current_settings)
     token = _serializer(current_settings).dumps({"sub": "admin", "exp": expires_at, "csrf": csrf})
     max_age = _session_seconds(current_settings)
@@ -321,7 +323,6 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
-        current_settings = settings()
         state = index_state()
         active_index = state.current
         return {
@@ -331,8 +332,6 @@ def create_app() -> FastAPI:
             "embedding_shape": active_index.embedding_shape if active_index else None,
             "views": list(active_index.texts.keys()) if active_index else ["statement", "abstract"],
             "switching": state.switching,
-            "data_dir": str(current_settings.data_dir),
-            "corpus_count": active_index.problem_count if active_index else 0,
         }
 
     @app.get("/api/config")
@@ -619,9 +618,28 @@ def create_app() -> FastAPI:
         return {"ok": True, "index_key": index_key}
 
     @app.get("/admin/api/audits")
-    def audits(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    def audits(
+        status: str | None = None,
+        q: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        limit: int = 50,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
         del session
-        return {"items": [_decode_audit(audit) for audit in list_search_audits(settings())]}
+        return {
+            "items": [
+                _decode_audit(audit)
+                for audit in list_search_audits(
+                    settings(),
+                    status=status,
+                    q=q,
+                    date_from=date_from,
+                    date_to=date_to,
+                    limit=limit,
+                )
+            ]
+        }
 
     @app.get("/admin/api/audits/{request_id}")
     def audit_detail(

@@ -6,7 +6,7 @@ This repository is designed for one machine, one Uvicorn process, one Uvicorn wo
 
 Install dependencies:
 
-```powershell
+```bash
 python -m pip install -r requirements.txt
 cd frontend
 npm install
@@ -15,7 +15,7 @@ npm run build
 
 Run:
 
-```powershell
+```bash
 uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
@@ -23,21 +23,22 @@ Do not run multiple Uvicorn workers against the same SQLite database.
 
 ## Admin Auth
 
-Set both variables before starting the service:
+Create the credential files configured in `config.toml` before starting the service:
 
-```powershell
-$env:YUANTIJI_ADMIN_PASSWORD_HASH = "<pbkdf2 hash>"
-$env:YUANTIJI_ADMIN_SIGNING_SECRET = "<long random secret>"
-```
-
-Generate a password hash:
-
-```powershell
-@'
+```bash
+mkdir -p data
+python - <<'PY' > data/admin_password.hash
 from core import hash_password
 print(hash_password("replace-me"))
-'@ | python -
+PY
+python - <<'PY' > data/admin_signing_secret
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+chmod 600 data/admin_password.hash data/admin_signing_secret
 ```
+
+Use your real admin password instead of `replace-me`.
 
 The admin UI is served at `/admin`.
 

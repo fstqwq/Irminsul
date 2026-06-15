@@ -9,6 +9,7 @@
   --accent: #4c56c5;
   --accent-dark: #303988;
   --accent-soft: #eef0ff;
+  --ok: #137f5c;
   --danger: #a53d54;
   --page-gap: 72px;
   --statement-max: 76ch;
@@ -1143,10 +1144,12 @@ button {
 
 .admin-side a,
 .admin-logout,
+.admin-refresh,
 .admin-table button,
 .admin-inline-form button,
 .admin-draft button,
 .admin-panel button,
+.admin-detail button,
 .admin-login button {
   border: 1px solid transparent;
   background: transparent;
@@ -1168,10 +1171,12 @@ button {
 
 .admin-side a:hover,
 .admin-logout:hover,
+.admin-refresh:hover,
 .admin-table button:hover,
 .admin-inline-form button:hover,
 .admin-draft button:hover,
 .admin-panel button:hover,
+.admin-detail button:hover,
 .admin-login button:hover {
   background: rgba(79, 91, 213, 0.07);
   color: var(--accent-dark);
@@ -1180,6 +1185,18 @@ button {
 .admin-logout {
   padding: 7px 8px;
   text-align: left;
+}
+
+.admin-refresh {
+  min-height: 34px;
+  padding: 0 12px;
+  border-color: var(--line);
+}
+
+.admin-refresh:disabled,
+.admin-table button:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 .admin-main {
@@ -1233,6 +1250,16 @@ button {
   color: var(--danger);
 }
 
+.admin-notice {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(19, 128, 92, 0.24);
+  background: rgba(19, 128, 92, 0.06);
+  color: var(--ok);
+  font-size: 14px;
+  line-height: 22px;
+}
+
 .admin-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(160px, 1fr));
@@ -1241,6 +1268,7 @@ button {
 
 .admin-metric,
 .admin-panel,
+.admin-detail,
 .admin-table-wrap,
 .admin-json,
 .admin-login form {
@@ -1271,8 +1299,21 @@ button {
   padding: 12px;
 }
 
+.admin-panel h2,
+.admin-detail h2,
+.admin-detail h3 {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 500;
+  font-variation-settings: "wght" 500;
+}
+
 .admin-inline-form,
-.admin-draft {
+.admin-draft,
+.admin-toolbar,
+.admin-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -1281,6 +1322,7 @@ button {
 
 .admin-inline-form input,
 .admin-inline-form select,
+.admin-edit-form input,
 .admin-login input {
   min-height: 34px;
   border: 1px solid var(--line);
@@ -1292,11 +1334,20 @@ button {
 .admin-inline-form button,
 .admin-draft button,
 .admin-panel button,
+.admin-detail button,
 .admin-login button {
   min-height: 34px;
   padding: 0 12px;
   border-color: var(--line);
   color: var(--accent-dark);
+}
+
+.admin-toolbar {
+  justify-content: space-between;
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 22px;
 }
 
 .admin-draft {
@@ -1343,6 +1394,132 @@ button {
 
 .admin-actions {
   white-space: nowrap;
+}
+
+.admin-detail {
+  margin-bottom: 14px;
+  padding: 14px;
+}
+
+.admin-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 18px;
+  margin: 0 0 12px;
+}
+
+.admin-detail-grid div {
+  min-width: 0;
+}
+
+.admin-detail-grid dt {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.admin-detail-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.admin-detail-block {
+  margin-top: 12px;
+}
+
+.admin-edit-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.admin-edit-form label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.admin-edit-form label:has(input[type="checkbox"]) {
+  display: flex;
+  align-items: center;
+}
+
+.admin-edit-form input {
+  width: 100%;
+  padding: 0 10px;
+}
+
+.admin-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.admin-kv {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.admin-kv th,
+.admin-kv td {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+}
+
+.admin-kv th {
+  width: 36%;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.admin-kv td {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+
+.admin-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.status-succeeded,
+.status-active,
+.status-built {
+  border-color: rgba(19, 128, 92, 0.24);
+  color: var(--ok);
+}
+
+.status-failed,
+.status-blocked {
+  border-color: rgba(165, 61, 84, 0.28);
+  color: var(--danger);
+}
+
+.status-running,
+.status-queued,
+.status-building {
+  border-color: rgba(79, 91, 213, 0.22);
+  color: var(--accent-dark);
 }
 
 .admin-json {

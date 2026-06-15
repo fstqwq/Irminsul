@@ -16,7 +16,6 @@ from typing import Any, Iterator
 
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
-PROTO_DIR = PROJECT_ROOT / "proto"
 DEFAULT_CONFIG_PATH = SRC_DIR / "config.toml"
 SCHEMA_VERSION = 1
 
@@ -42,14 +41,13 @@ class StorageConfig:
     db_path: Path
     upload_dir: Path
     index_cache_dir: Path
-    legacy_data_dir: Path
 
 
 @dataclass(frozen=True)
 class AdminConfig:
     session_hours: int
-    password_hash_env: str
-    signing_secret_env: str
+    password_hash_file: Path
+    signing_secret_file: Path
 
 
 @dataclass(frozen=True)
@@ -107,10 +105,6 @@ class Settings:
     embedding_model: ModelConfig
     rerank_model: ModelConfig
 
-    @property
-    def data_dir(self) -> Path:
-        return self.storage.legacy_data_dir
-
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -120,7 +114,6 @@ def load_dotenv(
     paths: tuple[Path, ...] = (
         SRC_DIR / ".env",
         PROJECT_ROOT / ".env",
-        PROTO_DIR / ".env",
     ),
 ) -> None:
     for path in paths:
@@ -144,13 +137,6 @@ def resolve_path(value: str) -> Path:
     return SRC_DIR / path
 
 
-def _resolve_project_path(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return PROJECT_ROOT / path
-
-
 def _model_config(name: str, data: dict[str, Any]) -> ModelConfig:
     missing = [key for key in ("model", "url", "api_key_env") if not data.get(key)]
     if missing:
@@ -170,7 +156,6 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
 
     raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
     storage = raw.get("storage", {})
-    old_data = raw.get("data", {})
     admin = raw.get("admin", {})
     limits = raw.get("limits", {})
     jobs = raw.get("jobs", {})
@@ -186,14 +171,15 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
             index_cache_dir=resolve_path(
                 str(storage.get("index_cache_dir", "data/index_cache"))
             ),
-            legacy_data_dir=_resolve_project_path(
-                str(storage.get("legacy_data_dir", old_data.get("dir", "data/cpret/P2Dup")))
-            ),
         ),
         admin=AdminConfig(
             session_hours=int(admin.get("session_hours", 8)),
-            password_hash_env=str(admin.get("password_hash_env", "YUANTIJI_ADMIN_PASSWORD_HASH")),
-            signing_secret_env=str(admin.get("signing_secret_env", "YUANTIJI_ADMIN_SIGNING_SECRET")),
+            password_hash_file=resolve_path(
+                str(admin.get("password_hash_file", "data/admin_password.hash"))
+            ),
+            signing_secret_file=resolve_path(
+                str(admin.get("signing_secret_file", "data/admin_signing_secret"))
+            ),
         ),
         limits=LimitsConfig(
             upload_max_bytes=int(limits.get("upload_max_bytes", 104_857_600)),

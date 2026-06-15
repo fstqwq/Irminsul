@@ -2,12 +2,11 @@
 db_path = "data/app.sqlite3"
 upload_dir = "data/uploads"
 index_cache_dir = "data/index_cache"
-legacy_data_dir = "data/cpret/P2Dup"
 
 [admin]
 session_hours = 8
-password_hash_env = "YUANTIJI_ADMIN_PASSWORD_HASH"
-signing_secret_env = "YUANTIJI_ADMIN_SIGNING_SECRET"
+password_hash_file = "data/admin_password.hash"
+signing_secret_file = "data/admin_signing_secret"
 
 [limits]
 upload_max_bytes = 104857600

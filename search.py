@@ -554,6 +554,12 @@ def _total_cost(api_calls: list[dict[str, Any]]) -> dict[str, int]:
     return {"microusd": total}
 
 
+def _date_bound(value: str, end_of_day: bool = False) -> str:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return f"{value}T{'23:59:59' if end_of_day else '00:00:00'}Z"
+    return value
+
+
 def retrieve_loaded_index(
     loaded_index: LoadedIndex,
     query_vectors: np.ndarray,
@@ -830,15 +836,38 @@ def write_search_audit(
             )
 
 
-def list_search_audits(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
+def list_search_audits(
+    settings: Settings,
+    status: str | None = None,
+    q: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if q.strip():
+        where.append("query LIKE ?")
+        params.append(f"%{q.strip()}%")
+    if date_from:
+        where.append("started_at >= ?")
+        params.append(_date_bound(date_from))
+    if date_to:
+        where.append("started_at <= ?")
+        params.append(_date_bound(date_to, end_of_day=True))
+    limit = max(1, min(limit, 500))
     with db_connection(settings) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM search_audits
+            WHERE {' AND '.join(where)}
             ORDER BY started_at DESC
             LIMIT ?
             """,
-            (limit,),
+            [*params, limit],
         ).fetchall()
     return [row_to_dict(row) for row in rows]
 

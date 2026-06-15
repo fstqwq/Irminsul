@@ -14,6 +14,21 @@ from core import db_connection, ensure_database, get_settings, hash_password, te
 from search import IndexState, RewriteResult
 
 
+def with_admin_credentials(settings, tmp_path: Path):
+    password_hash_file = tmp_path / "admin_password.hash"
+    signing_secret_file = tmp_path / "admin_signing_secret"
+    password_hash_file.write_text(hash_password("secret"), encoding="utf-8")
+    signing_secret_file.write_text("test-signing-secret", encoding="utf-8")
+    return replace(
+        settings,
+        admin=replace(
+            settings.admin,
+            password_hash_file=password_hash_file,
+            signing_secret_file=signing_secret_file,
+        ),
+    )
+
+
 def wait_for_job(client: TestClient, key: str, timeout: float = 5.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -34,6 +49,14 @@ def test_health_and_config() -> None:
 
     assert health.status_code == 200
     assert health.json()["ok"] is True
+    assert set(health.json()) == {
+        "ok",
+        "loaded_index_key",
+        "problem_count",
+        "embedding_shape",
+        "views",
+        "switching",
+    }
     assert health.json()["problem_count"] >= 0
     assert config.status_code == 200
     assert config.json()["top_display"] == 20
@@ -49,7 +72,7 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         upload_dir=tmp_path / "uploads",
         index_cache_dir=tmp_path / "index_cache",
     )
-    test_settings = replace(base_settings, storage=storage)
+    test_settings = with_admin_credentials(replace(base_settings, storage=storage), tmp_path)
     ensure_database(test_settings)
 
     state = IndexState()
@@ -99,8 +122,6 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
     monkeypatch.setattr(app_module, "index_state", lambda: state)
-    monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
-    monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
     monkeypatch.setattr(search_module, "rewrite_query_with_usage", fake_rewrite)
     monkeypatch.setattr(search_module, "embed_texts_with_usage", fake_embed)
     monkeypatch.setattr(search_module, "rerank_documents_with_usage", fake_rerank)
@@ -125,6 +146,17 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         assert audits.status_code == 200
         assert audits.json()["items"][0]["query"] == "hello"
         assert audits.json()["items"][0]["status"] == "succeeded"
+        audit_date = audits.json()["items"][0]["started_at"][:10]
+
+        filtered_audits = client.get(
+            f"/admin/api/audits?status=succeeded&q=hell&date_from={audit_date}&date_to={audit_date}"
+        )
+        assert filtered_audits.status_code == 200
+        assert filtered_audits.json()["items"][0]["request_id"] == audits.json()["items"][0]["request_id"]
+
+        empty_audits = client.get("/admin/api/audits?status=failed&q=hell")
+        assert empty_audits.status_code == 200
+        assert empty_audits.json()["items"] == []
 
     with db_connection(test_settings) as conn:
         audit = conn.execute("SELECT * FROM search_audits").fetchone()
@@ -155,14 +187,15 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         db_path=tmp_path / "app.sqlite3",
         upload_dir=tmp_path / "uploads",
     )
-    test_settings = replace(
-        base_settings,
-        storage=storage,
-        jobs=replace(base_settings.jobs, poll_seconds=0),
+    test_settings = with_admin_credentials(
+        replace(
+            base_settings,
+            storage=storage,
+            jobs=replace(base_settings.jobs, poll_seconds=0),
+        ),
+        tmp_path,
     )
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
-    monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
-    monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
 
     line = json.dumps(
         {
@@ -261,17 +294,18 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
         upload_dir=tmp_path / "uploads",
         index_cache_dir=tmp_path / "index_cache",
     )
-    test_settings = replace(
-        base_settings,
-        storage=storage,
-        jobs=replace(base_settings.jobs, poll_seconds=0),
+    test_settings = with_admin_credentials(
+        replace(
+            base_settings,
+            storage=storage,
+            jobs=replace(base_settings.jobs, poll_seconds=0),
+        ),
+        tmp_path,
     )
     ensure_database(test_settings)
     state = IndexState()
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
     monkeypatch.setattr(app_module, "index_state", lambda: state)
-    monkeypatch.setenv(test_settings.admin.password_hash_env, hash_password("secret"))
-    monkeypatch.setenv(test_settings.admin.signing_secret_env, "test-signing-secret")
 
     problem_text = "Build through API."
     problem_text_key = text_key(problem_text)

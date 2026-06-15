@@ -44,14 +44,14 @@ Language: use English for all code, comments, UI text, and API responses. Do not
 
 After backend changes:
 
-```powershell
-python -m pytest backend\tests -q -p no:cacheprovider
+```bash
+python -m pytest tests -q -p no:cacheprovider
 ```
 
 After frontend changes:
 
-```powershell
+```bash
 cd frontend && npm run build
 ```
 
-When the backend file layout changes (e.g. migrating from `backend/` to the planned 4-file structure), update the test commands in this file in the same commit.
+When the backend file layout changes, update the test commands in this file in the same commit.
