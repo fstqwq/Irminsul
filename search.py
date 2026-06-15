@@ -15,10 +15,19 @@ from typing import Any
 import numpy as np
 import requests
 
-from core import ModelConfig, Settings, db_connection, json_dumps, row_to_dict, utc_now
+from core import (
+    ModelConfig,
+    Settings,
+    db_read_connection,
+    db_write_connection,
+    json_dumps,
+    row_to_dict,
+    utc_now,
+)
 
 
 VIEWS = ("clean", "statement", "abstract", "abstract_zh")
+REWRITE_VIEW_MAX_CHARS = 10_000
 
 
 @dataclass(frozen=True)
@@ -261,6 +270,14 @@ def _extract_section(text: str, name: str, next_starts: list[int]) -> str:
     return value
 
 
+def _validate_rewrite_lengths(sections: dict[str, str]) -> None:
+    for name, value in sections.items():
+        if len(value) > REWRITE_VIEW_MAX_CHARS:
+            raise RewriteFormatError(
+                f"{name}_section_too_long:{len(value)}>{REWRITE_VIEW_MAX_CHARS}"
+            )
+
+
 def parse_rewrite_output(text: str) -> RewriteResult:
     markers = {
         name: match
@@ -284,6 +301,13 @@ def parse_rewrite_output(text: str) -> RewriteResult:
         raise RewriteFormatError("empty_statement_section")
     if not abstract:
         raise RewriteFormatError("empty_abstract_section")
+    sections = {
+        "clean": clean,
+        "statement": statement,
+        "abstract": abstract,
+        "abstract_zh": abstract_zh,
+    }
+    _validate_rewrite_lengths(sections)
     return RewriteResult(
         statement=statement,
         abstract=abstract,
@@ -310,22 +334,25 @@ def rewrite_query_with_usage(
 ) -> RewriteCallResult:
     if not model_config.api_key:
         raise ValueError(f"{model_config.api_key_env} is not configured")
+    request_body: dict[str, Any] = {
+        "model": model_config.model,
+        "messages": [
+            {"role": "system", "content": REWRITE_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0,
+        "thinking": {"type": "disabled"},
+        "stream": False,
+    }
+    if model_config.provider:
+        request_body["provider"] = model_config.provider
     response = requests.post(
         model_config.resolved_url,
         headers={
             "Authorization": f"Bearer {model_config.api_key}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": model_config.model,
-            "messages": [
-                {"role": "system", "content": REWRITE_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0,
-            "thinking": {"type": "disabled"},
-            "stream": False,
-        },
+        json=request_body,
         timeout=timeout,
     )
     response.raise_for_status()
@@ -434,8 +461,11 @@ def fuse_scores(
     if not rerank_scores:
         return sorted(
             [replace(candidate, final_score=candidate.embedding_score) for candidate in candidates],
-            key=lambda candidate: (candidate.final_score or 0.0, candidate.embedding_score),
-            reverse=True,
+            key=lambda candidate: (
+                -(candidate.final_score or 0.0),
+                -candidate.embedding_score,
+                candidate.problem_id,
+            ),
         )
 
     embeddings = [candidate.embedding_score for candidate in candidates]
@@ -462,12 +492,11 @@ def fuse_scores(
     return sorted(
         fused,
         key=lambda candidate: (
-            candidate.final_score or 0.0,
-            candidate.rerank_score if candidate.rerank_score is not None else -1.0,
-            candidate.embedding_score,
+            -(candidate.final_score or 0.0),
+            -(candidate.rerank_score if candidate.rerank_score is not None else -1.0),
+            -candidate.embedding_score,
             candidate.problem_id,
         ),
-        reverse=True,
     )
 
 
@@ -828,7 +857,7 @@ def write_search_audit(
     error: str | None,
 ) -> None:
     finished_at = utc_now()
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -878,7 +907,7 @@ def list_search_audits(
         where.append("started_at <= ?")
         params.append(_date_bound(date_to, end_of_day=True))
     limit = max(1, min(limit, 500))
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         rows = conn.execute(
             f"""
             SELECT * FROM search_audits
@@ -892,7 +921,7 @@ def list_search_audits(
 
 
 def get_search_audit(settings: Settings, request_id: str) -> dict[str, Any] | None:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute(
             "SELECT * FROM search_audits WHERE request_id = ?",
             (request_id,),
