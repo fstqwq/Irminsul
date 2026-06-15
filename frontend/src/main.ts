@@ -5,7 +5,15 @@ import "temml/dist/Temml-Local.css";
 import { fetchConfig, fetchHealth, streamSearch, type StreamEvent } from "./api";
 import { startAdmin } from "./admin";
 import { renderApp, type Actions } from "./render";
-import { createInitialState, initialStages, saveResultView, stageOrder, type ResultView, type SortMode } from "./state";
+import {
+  createInitialState,
+  initialStages,
+  saveResultView,
+  stageOrder,
+  type RewritePayload,
+  type ResultView,
+  type SortMode
+} from "./state";
 import "./styles.css";
 
 const root = document.getElementById("root");
@@ -58,18 +66,15 @@ const actions: Actions = {
     state.settingsOpen = false;
     render();
   },
-  setEditStatement(value) {
-    state.editStatement = value;
-  },
-  setEditAbstract(value) {
-    state.editAbstract = value;
+  setEditRewrite(view, value) {
+    state.editRewrite = {
+      ...state.editRewrite,
+      [view]: value
+    };
   },
   resubmitRewrite() {
-    if (!state.editStatement.trim()) return;
-    void runSearch({
-      statement: state.editStatement,
-      abstract: state.editAbstract
-    });
+    if (!state.editRewrite.statement.trim()) return;
+    void runSearch(state.editRewrite);
   },
 };
 
@@ -77,7 +82,7 @@ function render(): void {
   renderApp(appRoot, state, actions);
 }
 
-async function runSearch(overrides?: { statement?: string; abstract?: string }): Promise<void> {
+async function runSearch(overrides?: RewritePayload): Promise<void> {
   const queryText = state.queryText.trim();
   if (!queryText) return;
 
@@ -94,8 +99,13 @@ async function runSearch(overrides?: { statement?: string; abstract?: string }):
   if (!overrides) {
     state.rewrite = null;
     state.rewriteOpen = false;
-    state.editStatement = "";
-    state.editAbstract = "";
+    state.editRewrite = {
+      clean: "",
+      statement: "",
+      abstract: "",
+      abstract_zh: "",
+      raw: ""
+    };
   }
   render();
 
@@ -106,8 +116,10 @@ async function runSearch(overrides?: { statement?: string; abstract?: string }):
         use_rewrite: state.useRewrite,
         use_rerank: state.useRerank,
         beta: state.config.default_beta,
+        edited_clean: overrides?.clean,
         edited_statement: overrides?.statement,
-        edited_abstract: overrides?.abstract
+        edited_abstract: overrides?.abstract,
+        edited_abstract_zh: overrides?.abstract_zh
       },
       handleEvent,
       abortController.signal
@@ -140,8 +152,14 @@ function handleEvent(event: StreamEvent): void {
       raw: event.raw,
       edited: event.edited
     };
-    state.editStatement = event.statement;
-    state.editAbstract = event.abstract;
+    state.editRewrite = {
+      clean: event.clean,
+      statement: event.statement,
+      abstract: event.abstract,
+      abstract_zh: event.abstract_zh,
+      raw: event.raw,
+      edited: event.edited
+    };
     render();
     return;
   }

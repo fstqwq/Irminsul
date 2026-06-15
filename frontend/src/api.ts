@@ -14,8 +14,10 @@ export type SearchRequest = {
   use_rewrite: boolean;
   use_rerank: boolean;
   beta: number;
+  edited_clean?: string;
   edited_statement?: string;
   edited_abstract?: string;
+  edited_abstract_zh?: string;
 };
 
 export async function fetchConfig(): Promise<Config> {

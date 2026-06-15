@@ -654,16 +654,18 @@ def search_events_loaded(
     api_calls: list[dict[str, Any]] = []
 
     try:
-        edited_statement = (request.edited_statement or "").strip()
-        edited_abstract = (request.edited_abstract or "").strip()
+        edited_clean = (getattr(request, "edited_clean", None) or "").strip()
+        edited_statement = (getattr(request, "edited_statement", None) or "").strip()
+        edited_abstract = (getattr(request, "edited_abstract", None) or "").strip()
+        edited_abstract_zh = (getattr(request, "edited_abstract_zh", None) or "").strip()
 
         if edited_statement:
             timings["rewrite"] = "edited"
             rewrite = RewriteResult(
-                clean=edited_statement,
+                clean=edited_clean or edited_statement,
                 statement=edited_statement,
                 abstract=edited_abstract or edited_statement,
-                abstract_zh=edited_abstract or edited_statement,
+                abstract_zh=edited_abstract_zh or edited_abstract or edited_statement,
                 raw="",
             )
             yield _stage("rewrite", "done", detail="edited")

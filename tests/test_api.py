@@ -246,8 +246,10 @@ def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch,
                 query_text="hello",
                 use_rewrite=False,
                 use_rerank=True,
+                edited_clean="",
                 edited_statement="",
                 edited_abstract="",
+                edited_abstract_zh="",
                 beta=0.75,
             ),
             test_settings,
@@ -258,6 +260,74 @@ def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch,
 
     assert [candidate["problem_id"] for candidate in candidates] == ["d_2", "d_1"]
     assert all(candidate["rerank_score"] is not None for candidate in candidates)
+
+
+def test_search_edited_rewrite_uses_all_four_views(monkeypatch) -> None:
+    import search as search_module
+
+    base_settings = get_settings()
+    test_settings = replace(
+        base_settings,
+        search=replace(base_settings.search, default_rerank=False),
+    )
+    loaded_index = search_module.LoadedIndex(
+        key="i:test",
+        problem_keys=["d_1"],
+        titles=["One"],
+        urls=[""],
+        texts={
+            "clean": ["original"],
+            "statement": ["statement"],
+            "abstract": ["abstract"],
+            "abstract_zh": ["abstract zh"],
+        },
+        matrices={
+            view: np.array([[1.0, 0.0]], dtype=np.float32)
+            for view in search_module.VIEWS
+        },
+        load_mode="ram",
+    )
+    captured: dict[str, list[str]] = {}
+
+    def fake_embed(*args, **kwargs):
+        captured["texts"] = args[1]
+        return search_module.EmbeddingCallResult(
+            np.array([[1.0, 0.0]] * len(args[1]), dtype=np.float32),
+            {"input_count": len(args[1])},
+        )
+
+    monkeypatch.setattr(search_module, "embed_texts_with_usage", fake_embed)
+
+    events = [
+        json.loads(line)
+        for line in search_module.search_events_loaded(
+            SimpleNamespace(
+                query_text="hello",
+                use_rewrite=True,
+                use_rerank=False,
+                edited_clean="edited clean",
+                edited_statement="edited statement",
+                edited_abstract="edited abstract",
+                edited_abstract_zh="edited zh",
+                beta=0.75,
+            ),
+            test_settings,
+            loaded_index,
+        )
+    ]
+
+    rewrite_event = [event for event in events if event["type"] == "rewrite"][0]
+    assert rewrite_event["edited"] is True
+    assert rewrite_event["clean"] == "edited clean"
+    assert rewrite_event["statement"] == "edited statement"
+    assert rewrite_event["abstract"] == "edited abstract"
+    assert rewrite_event["abstract_zh"] == "edited zh"
+    assert captured["texts"] == [
+        "edited clean",
+        "edited statement",
+        "edited abstract",
+        "edited zh",
+    ]
 
 
 def test_search_requires_active_index(monkeypatch) -> None:

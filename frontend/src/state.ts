@@ -63,8 +63,7 @@ export type AppState = {
   settingsOpen: boolean;
   rewriteOpen: boolean;
   rewrite: RewritePayload | null;
-  editStatement: string;
-  editAbstract: string;
+  editRewrite: RewritePayload;
   stages: Record<StageName, Stage>;
   candidates: Candidate[];
   cost: Cost | null;
@@ -148,8 +147,13 @@ export function createInitialState(): AppState {
     settingsOpen: false,
     rewriteOpen: false,
     rewrite: null,
-    editStatement: "",
-    editAbstract: "",
+    editRewrite: {
+      clean: "",
+      statement: "",
+      abstract: "",
+      abstract_zh: "",
+      raw: ""
+    },
     stages: initialStages(),
     candidates: [],
     cost: null,

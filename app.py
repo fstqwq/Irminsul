@@ -74,8 +74,10 @@ class SearchRequest(BaseModel):
     use_rewrite: bool = True
     use_rerank: bool = True
     beta: float = Field(default=0.75, ge=0.0, le=1.0)
+    edited_clean: str | None = None
     edited_statement: str | None = None
     edited_abstract: str | None = None
+    edited_abstract_zh: str | None = None
 
 
 class LoginRequest(BaseModel):

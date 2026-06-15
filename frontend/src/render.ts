@@ -24,8 +24,7 @@ export type Actions = {
   setSortMode(value: SortMode): void;
   setResultView(value: ResultView): void;
   toggleRewrite(): void;
-  setEditStatement(value: string): void;
-  setEditAbstract(value: string): void;
+  setEditRewrite(view: ResultView, value: string): void;
   resubmitRewrite(): void;
 };
 
@@ -169,20 +168,22 @@ function renderStatus(state: AppState): string {
 }
 
 function renderRewritePopover(state: AppState): string {
+  const editViews: ResultView[] = ["clean", "statement", "abstract", "abstract_zh"];
   return `
     <div class="rewrite-popover" role="dialog" aria-label="Rewrite edit">
       <button id="rewriteClose" class="rewrite-close" type="button" aria-label="Close rewrite editor" title="Close">
         ${icon("x")}
       </button>
-      <label>
-        <span>Statement</span>
-        <textarea id="editStatement" rows="3">${escapeHtml(state.editStatement)}</textarea>
-      </label>
-      <label>
-        <span>Abstract</span>
-        <textarea id="editAbstract" rows="3">${escapeHtml(state.editAbstract)}</textarea>
-      </label>
-      <button id="resubmitRewrite" class="ghost-action" type="button" ${state.isRunning || !state.editStatement.trim() ? "disabled" : ""}>
+      ${editViews
+        .map(
+          (view) => `
+            <label>
+              <span>${escapeHtml(resultViewLabels[view])}</span>
+              <textarea data-edit-rewrite="${view}" rows="3">${escapeHtml(state.editRewrite[view])}</textarea>
+            </label>`
+        )
+        .join("")}
+      <button id="resubmitRewrite" class="ghost-action" type="button" ${state.isRunning || !state.editRewrite.statement.trim() ? "disabled" : ""}>
         Resubmit
       </button>
     </div>`;
@@ -374,13 +375,12 @@ function bind(root: HTMLElement, actions: Actions): void {
     actions.toggleRewrite();
   });
   root.querySelector<HTMLButtonElement>("#rewriteClose")?.addEventListener("click", actions.toggleRewrite);
-  root.querySelector<HTMLTextAreaElement>("#editStatement")?.addEventListener("input", (event) => {
-    actions.setEditStatement((event.currentTarget as HTMLTextAreaElement).value);
-    autosize(event.currentTarget as HTMLTextAreaElement);
-  });
-  root.querySelector<HTMLTextAreaElement>("#editAbstract")?.addEventListener("input", (event) => {
-    actions.setEditAbstract((event.currentTarget as HTMLTextAreaElement).value);
-    autosize(event.currentTarget as HTMLTextAreaElement);
+  root.querySelectorAll<HTMLTextAreaElement>("[data-edit-rewrite]").forEach((textarea) => {
+    textarea.addEventListener("input", (event) => {
+      const target = event.currentTarget as HTMLTextAreaElement;
+      actions.setEditRewrite(target.dataset.editRewrite as ResultView, target.value);
+      autosize(target);
+    });
   });
   root.querySelector<HTMLButtonElement>("#resubmitRewrite")?.addEventListener("click", actions.resubmitRewrite);
 
