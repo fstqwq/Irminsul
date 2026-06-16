@@ -369,7 +369,7 @@ function bind(root: HTMLElement, actions: Actions): void {
     autosize(queryInput);
   });
   queryInput?.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       actions.submit();
     }
