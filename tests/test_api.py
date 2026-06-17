@@ -264,14 +264,22 @@ def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch,
     assert all(candidate["rerank_score"] is not None for candidate in candidates)
 
 
-def test_search_edited_rewrite_uses_all_four_views(monkeypatch) -> None:
+def test_search_edited_rewrite_uses_all_four_views(monkeypatch, tmp_path: Path) -> None:
     import search as search_module
 
     base_settings = get_settings()
+    storage = replace(
+        base_settings.storage,
+        db_path=tmp_path / "app.sqlite3",
+        upload_dir=tmp_path / "uploads",
+        index_cache_dir=tmp_path / "index_cache",
+    )
     test_settings = replace(
         base_settings,
+        storage=storage,
         search=replace(base_settings.search, default_rerank=False),
     )
+    ensure_database(test_settings)
     loaded_index = search_module.LoadedIndex(
         key="i:test",
         problem_keys=["d_1"],
