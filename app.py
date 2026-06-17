@@ -23,6 +23,7 @@ from core import (
     Settings,
     batch_update_problems,
     cancel_job,
+    db_exec_many,
     db_read_connection,
     db_write_connection,
     delete_index,
@@ -250,72 +251,32 @@ def _activate_index(current_settings: Settings, selected_index_key: str, state: 
     )
     state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
     now = utc_now()
-    with db_write_connection(current_settings) as conn:
-        with conn:
-            conn.execute("UPDATE indexes SET status = 'retired' WHERE status = 'active'")
-            conn.execute(
-                """
-                UPDATE indexes
-                SET status = 'active', activated_at = ?, error = NULL
-                WHERE key = ?
-                """,
+    db_exec_many(
+        current_settings,
+        [
+            ("UPDATE indexes SET status = 'retired' WHERE status = 'active'", ()),
+            (
+                "UPDATE indexes SET status = 'active', activated_at = ?, error = NULL WHERE key = ?",
                 (now, selected_index_key),
-            )
-            conn.execute(
-                """
-                INSERT INTO kv(key, value, updated_at)
-                VALUES ('active_index_key', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                  value = excluded.value,
-                  updated_at = excluded.updated_at
-                """,
+            ),
+            (
+                "INSERT INTO kv(key, value, updated_at) VALUES ('active_index_key', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 (selected_index_key, now),
-            )
+            ),
+        ],
+    )
 
 
-def _decode_job(job: dict[str, Any]) -> dict[str, Any]:
-    decoded = dict(job)
-    for key in ("payload", "progress", "result"):
-        value = decoded.get(key)
-        if isinstance(value, str) and value:
-            try:
-                decoded[key] = json.loads(value)
-            except ValueError:
-                decoded[key] = value
-    return decoded
-
-
-def _decode_job_log(row: dict[str, Any]) -> dict[str, Any]:
+def _decode_json_fields(row: dict[str, Any], *fields: str) -> dict[str, Any]:
     decoded = dict(row)
-    value = decoded.get("data")
-    if isinstance(value, str) and value:
-        try:
-            decoded["data"] = json.loads(value)
-        except ValueError:
-            decoded["data"] = value
-    return decoded
-
-
-def _decode_index(index: dict[str, Any]) -> dict[str, Any]:
-    decoded = dict(index)
-    value = decoded.get("meta")
-    if isinstance(value, str) and value:
-        try:
-            decoded["meta"] = json.loads(value)
-        except ValueError:
-            decoded["meta"] = value
-    return decoded
-
-
-def _decode_audit(audit: dict[str, Any]) -> dict[str, Any]:
-    decoded = dict(audit)
-    for key in ("timings", "api_calls", "result", "cost"):
-        value = decoded.get(key)
+    for field in fields:
+        value = decoded.get(field)
         if isinstance(value, str) and value:
             try:
-                decoded[key] = json.loads(value)
+                decoded[field] = json.loads(value)
             except ValueError:
-                decoded[key] = value
+                pass
     return decoded
 
 
@@ -521,7 +482,9 @@ def create_app() -> FastAPI:
             "source_count": source_count,
             "active_index_key": active["value"] if active else None,
             "active_index_problem_count": active_index_problem_count,
-            "current_job": _decode_job(row_to_dict(current_job)) if current_job else None,
+            "current_job": _decode_json_fields(row_to_dict(current_job), "payload", "progress", "result")
+            if current_job
+            else None,
             "today_searches": today_searches,
         }
 
@@ -612,7 +575,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         del session
         try:
-            return _decode_job(confirm_import_job(job_key, settings()))
+            return _decode_json_fields(confirm_import_job(job_key, settings()), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -623,7 +586,14 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         del session
         try:
-            return {"deleted": _decode_job(delete_import_draft(job_key, settings()))}
+            return {
+                "deleted": _decode_json_fields(
+                    delete_import_draft(job_key, settings()),
+                    "payload",
+                    "progress",
+                    "result",
+                )
+            }
         except ValueError as exc:
             detail = str(exc)
             status_code = 404 if "not found" in detail else 400
@@ -632,7 +602,12 @@ def create_app() -> FastAPI:
     @app.get("/admin/api/imports")
     def imports(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
-        return {"items": [_decode_job(job) for job in list_import_jobs(settings())]}
+        return {
+            "items": [
+                _decode_json_fields(job, "payload", "progress", "result")
+                for job in list_import_jobs(settings())
+            ]
+        }
 
     @app.get("/admin/api/imports/{job_key}")
     def import_detail(
@@ -643,7 +618,7 @@ def create_app() -> FastAPI:
         job = get_job(settings(), job_key)
         if job is None or job["type"] != "import":
             raise HTTPException(status_code=404, detail="Import job not found")
-        return _decode_job(job)
+        return _decode_json_fields(job, "payload", "progress", "result")
 
     @app.get("/admin/api/jobs")
     def jobs(
@@ -653,7 +628,12 @@ def create_app() -> FastAPI:
         session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
         del session
-        return {"items": [_decode_job(job) for job in list_jobs(settings(), type, status, limit)]}
+        return {
+            "items": [
+                _decode_json_fields(job, "payload", "progress", "result")
+                for job in list_jobs(settings(), type, status, limit)
+            ]
+        }
 
     @app.get("/admin/api/jobs/{job_key}")
     def job_detail(
@@ -664,8 +644,8 @@ def create_app() -> FastAPI:
         job = get_job(settings(), job_key)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
-        decoded = _decode_job(job)
-        logs = [_decode_job_log(row) for row in list_job_logs(settings(), job_key)]
+        decoded = _decode_json_fields(job, "payload", "progress", "result")
+        logs = [_decode_json_fields(row, "data") for row in list_job_logs(settings(), job_key)]
         decoded["logs"] = logs
         return decoded
 
@@ -676,7 +656,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         del session
         try:
-            return _decode_job(retry_job(settings(), job_key))
+            return _decode_json_fields(retry_job(settings(), job_key), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -687,7 +667,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         del session
         try:
-            return _decode_job(cancel_job(settings(), job_key))
+            return _decode_json_fields(cancel_job(settings(), job_key), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -695,14 +675,14 @@ def create_app() -> FastAPI:
     def index_build(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
         try:
-            return _decode_job(create_build_index_job(settings()))
+            return _decode_json_fields(create_build_index_job(settings()), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/admin/api/indexes")
     def indexes(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
-        return {"items": [_decode_index(index) for index in list_indexes(settings())]}
+        return {"items": [_decode_json_fields(index, "meta") for index in list_indexes(settings())]}
 
     @app.get("/admin/api/indexes/{index_key}")
     def index_detail(
@@ -713,7 +693,7 @@ def create_app() -> FastAPI:
         index = get_index(settings(), index_key)
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")
-        return _decode_index(index)
+        return _decode_json_fields(index, "meta")
 
     @app.delete("/admin/api/indexes/{index_key}")
     def index_delete(
@@ -722,7 +702,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         del session
         try:
-            return _decode_index(delete_index(settings(), index_key))
+            return _decode_json_fields(delete_index(settings(), index_key), "meta")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -739,7 +719,7 @@ def create_app() -> FastAPI:
         index = get_index(settings(), index_key)
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")
-        return _decode_index(index)
+        return _decode_json_fields(index, "meta")
 
     @app.post("/admin/api/index/{index_key}/cache/rebuild")
     def index_cache_rebuild(
@@ -748,7 +728,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         del session
         try:
-            return _decode_index(rebuild_index_cache(settings(), index_key))
+            return _decode_json_fields(rebuild_index_cache(settings(), index_key), "meta")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -776,7 +756,7 @@ def create_app() -> FastAPI:
         del session
         return {
             "items": [
-                _decode_audit(audit)
+                _decode_json_fields(audit, "timings", "api_calls", "result", "cost")
                 for audit in list_search_audits(
                     settings(),
                     status=status,
@@ -797,7 +777,7 @@ def create_app() -> FastAPI:
         audit = get_search_audit(settings(), request_id)
         if audit is None:
             raise HTTPException(status_code=404, detail="Audit not found")
-        return _decode_audit(audit)
+        return _decode_json_fields(audit, "timings", "api_calls", "result", "cost")
 
     @app.get("/admin/api/settings")
     def admin_settings(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:

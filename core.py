@@ -776,47 +776,39 @@ def patch_problem(settings: Settings, problem_key: str, changes: dict[str, Any])
 def batch_update_problems(settings: Settings, keys: list[str], action: str) -> dict[str, Any]:
     if not keys:
         raise ValueError("keys are required")
-    if action not in {"enable", "disable", "delete", "restore"}:
+    actions = {
+        "enable": "enabled = 1",
+        "disable": "enabled = 0",
+        "delete": "deleted = 1",
+        "restore": "deleted = 0",
+    }
+    if action not in actions:
         raise ValueError("invalid batch action")
-    if action == "enable":
-        assignments = "enabled = 1"
-    elif action == "disable":
-        assignments = "enabled = 0"
-    elif action == "delete":
-        assignments = "deleted = 1"
-    else:
-        assignments = "deleted = 0"
 
     placeholders = ",".join("?" for _ in keys)
-    with db_write_connection(settings) as conn:
-        with conn:
-            cursor = conn.execute(
-                f"""
-                UPDATE problems
-                SET {assignments}, updated_at = ?
-                WHERE key IN ({placeholders})
-                """,
-                [utc_now(), *keys],
-            )
-    return {"updated": cursor.rowcount}
+    rowcount = db_exec(
+        settings,
+        f"UPDATE problems SET {actions[action]}, updated_at = ? WHERE key IN ({placeholders})",
+        [utc_now(), *keys],
+    )
+    return {"updated": rowcount}
 
 
 def list_sources(settings: Settings) -> list[dict[str, Any]]:
-    with db_read_connection(settings) as conn:
-        rows = conn.execute(
-            """
-            SELECT
-              s.key, s.name, s.enabled, s.updated_at,
-              count(p.key) AS problem_count,
-              sum(CASE WHEN p.enabled = 1 AND p.deleted = 0 THEN 1 ELSE 0 END) AS enabled_problem_count,
-              sum(CASE WHEN p.deleted = 1 THEN 1 ELSE 0 END) AS deleted_count
-            FROM sources s
-            LEFT JOIN problems p ON p.source_key = s.key
-            GROUP BY s.key, s.name, s.enabled, s.updated_at
-            ORDER BY s.key
-            """
-        ).fetchall()
-    return [row_to_dict(row) for row in rows]
+    return db_all(
+        settings,
+        """
+        SELECT
+          s.key, s.name, s.enabled, s.updated_at,
+          count(p.key) AS problem_count,
+          sum(CASE WHEN p.enabled = 1 AND p.deleted = 0 THEN 1 ELSE 0 END) AS enabled_problem_count,
+          sum(CASE WHEN p.deleted = 1 THEN 1 ELSE 0 END) AS deleted_count
+        FROM sources s
+        LEFT JOIN problems p ON p.source_key = s.key
+        GROUP BY s.key, s.name, s.enabled, s.updated_at
+        ORDER BY s.key
+        """,
+    )
 
 
 def patch_source(settings: Settings, source_key: str, changes: dict[str, Any]) -> dict[str, Any]:
@@ -859,17 +851,11 @@ def list_jobs(
         where.append("status = ?")
         params.append(status)
     limit = max(1, min(limit, 500))
-    with db_read_connection(settings) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT * FROM jobs
-            WHERE {' AND '.join(where)}
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            [*params, limit],
-        ).fetchall()
-    return [row_to_dict(row) for row in rows]
+    return db_all(
+        settings,
+        f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ?",
+        [*params, limit],
+    )
 
 
 def append_job_log(
@@ -902,16 +888,12 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
         raise ValueError("job not found")
     if job["status"] not in {"blocked", "failed"}:
         raise ValueError("job is not retryable")
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'queued', progress = ?, result = NULL, error = NULL, updated_at = ?
-                WHERE key = ?
-                """,
-                (json_dumps({"phase": "queued"}), utc_now(), job_key),
-            )
+    db_exec(
+        settings,
+        "UPDATE jobs SET status = 'queued', progress = ?, result = NULL, error = NULL, updated_at = ? "
+        "WHERE key = ?",
+        (json_dumps({"phase": "queued"}), utc_now(), job_key),
+    )
     append_job_log(settings, job_key, "info", "Job queued for retry")
     return get_job(settings, job_key) or job
 
@@ -971,8 +953,8 @@ def mark_job_failed(settings: Settings, job_key: str, error: str) -> None:
     )
 
 
-def job_progress(job: dict[str, Any]) -> dict[str, Any]:
-    raw = job.get("progress")
+def _parse_json_field(row: dict[str, Any], field: str) -> dict[str, Any]:
+    raw = row.get(field)
     if isinstance(raw, dict):
         return dict(raw)
     if isinstance(raw, str) and raw:
@@ -981,22 +963,16 @@ def job_progress(job: dict[str, Any]) -> dict[str, Any]:
             if isinstance(parsed, dict):
                 return parsed
         except ValueError:
-            return {}
+            pass
     return {}
+
+
+def job_progress(job: dict[str, Any]) -> dict[str, Any]:
+    return _parse_json_field(job, "progress")
 
 
 def job_result(job: dict[str, Any]) -> dict[str, Any]:
-    raw = job.get("result")
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str) and raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except ValueError:
-            return {}
-    return {}
+    return _parse_json_field(job, "result")
 
 
 def cancel_requested(settings: Settings, job_key: str) -> bool:
@@ -1031,16 +1007,14 @@ def update_job_progress(
                 if current_progress.get("cancel_requested") and not progress.get("cancel_requested"):
                     progress = dict(progress)
                     progress["cancel_requested"] = True
+            params: list[Any] = [json_dumps(progress)]
+            sql = "UPDATE jobs SET progress = ?"
             if result is None:
-                conn.execute(
-                    "UPDATE jobs SET progress = ?, updated_at = ? WHERE key = ?",
-                    (json_dumps(progress), utc_now(), job_key),
-                )
+                sql += ", updated_at = ? WHERE key = ?"
             else:
-                conn.execute(
-                    "UPDATE jobs SET progress = ?, result = ?, updated_at = ? WHERE key = ?",
-                    (json_dumps(progress), json_dumps(result), utc_now(), job_key),
-                )
+                sql += ", result = ?, updated_at = ? WHERE key = ?"
+                params.append(json_dumps(result))
+            conn.execute(sql, [*params, utc_now(), job_key])
 
 
 def finish_job(

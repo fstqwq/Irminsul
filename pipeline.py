@@ -21,6 +21,7 @@ from core import (
     append_job_log,
     cancel_requested,
     canonical_text,
+    db_exec,
     db_one,
     db_read_connection,
     db_write_connection,
@@ -510,17 +511,11 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
         path = Path(payload["path"])
         mode = _validate_import_mode(str(payload["mode"]))
 
-    now = utc_now()
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'running', progress = ?, updated_at = ?
-                WHERE key = ?
-                """,
-                (json_dumps({"phase": "reading"}), now, job_key),
-            )
+    db_exec(
+        settings,
+        "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ?",
+        (json_dumps({"phase": "reading"}), utc_now(), job_key),
+    )
 
     rows, errors = read_import_jsonl(path, settings)
     if errors:
@@ -871,32 +866,22 @@ def _rewrite_payload(rewrite: RewriteResult, settings: Settings) -> dict[str, An
 
 
 def _mark_artifact_failed(settings: Settings, artifact_key: str, error: str) -> None:
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE artifacts
-                SET status = 'failed', error = ?, updated_at = ?
-                WHERE key = ?
-                """,
-                (error[:4000], utc_now(), artifact_key),
-            )
+    db_exec(
+        settings,
+        "UPDATE artifacts SET status = 'failed', error = ?, updated_at = ? WHERE key = ?",
+        (error[:4000], utc_now(), artifact_key),
+    )
 
 
 def _mark_artifacts_running(settings: Settings, artifact_keys: list[str]) -> None:
     if not artifact_keys:
         return
     placeholders = ",".join("?" for _ in artifact_keys)
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                f"""
-                UPDATE artifacts
-                SET status = 'running', error = NULL, updated_at = ?
-                WHERE key IN ({placeholders})
-                """,
-                [utc_now(), *artifact_keys],
-            )
+    db_exec(
+        settings,
+        f"UPDATE artifacts SET status = 'running', error = NULL, updated_at = ? WHERE key IN ({placeholders})",
+        [utc_now(), *artifact_keys],
+    )
 
 
 def _store_embedding_items_batch(
@@ -1085,13 +1070,7 @@ def _ensure_rewrites_for_snapshot(
         else:
             message = str(error)
             for problem in problems:
-                _record_problem_failure(
-                    failures,
-                    failed_problem_keys,
-                    problem,
-                    "rewrite",
-                    message,
-                )
+                _record_problem_failure(failures, failed_problem_keys, problem, "rewrite", message)
             job_ctx.error(
                 "Rewrite failed",
                 {
@@ -1130,16 +1109,12 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             return job_ctx.finish("failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
 
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'running', progress = ?, result = NULL, error = NULL, updated_at = ?
-                WHERE key = ?
-                """,
-                (json_dumps({"phase": "rewrite"}), utc_now(), job_key),
-            )
+    db_exec(
+        settings,
+        "UPDATE jobs SET status = 'running', progress = ?, result = NULL, error = NULL, updated_at = ? "
+        "WHERE key = ?",
+        (json_dumps({"phase": "rewrite"}), utc_now(), job_key),
+    )
 
     snapshot = read_jsonl_list(Path(payload["snapshot_path"]))
     job_ctx.info("Build index started", {"total": len(snapshot)})
@@ -1258,13 +1233,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             affected_rewrite_keys = sorted({item.rewrite_key for item in batch})
             for rewrite_key_value in affected_rewrite_keys:
                 for problem in problems_by_rewrite_key.get(rewrite_key_value, []):
-                    _record_problem_failure(
-                        failures,
-                        failed_problem_keys,
-                        problem,
-                        "embedding",
-                        message,
-                    )
+                    _record_problem_failure(failures, failed_problem_keys, problem, "embedding", message)
             job_ctx.error(
                 "Embedding batch failed",
                 {
@@ -1322,11 +1291,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         rewrite = rewrite_by_text_key.get(problem["text_key"])
         if rewrite is None:
             _record_problem_failure(
-                failures,
-                failed_problem_keys,
-                problem,
-                "rewrite",
-                "rewrite artifact was not prepared",
+                failures, failed_problem_keys, problem, "rewrite", "rewrite artifact was not prepared"
             )
             continue
         embeddings = embedding_artifacts.get(rewrite["key"], {})
