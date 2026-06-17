@@ -19,26 +19,26 @@ from core import (
     SCHEMA_VERSION,
     Settings,
     append_job_log,
-    cancel_requested as _cancel_requested,
+    cancel_requested,
     canonical_text,
     db_read_connection,
     db_write_connection,
     embedding_key,
-    finish_if_cancel_requested as _finish_if_cancel_requested,
-    finish_job as _finish_job,
+    finish_if_cancel_requested,
+    finish_job,
     get_index,
     get_job,
     index_key,
     json_dumps,
-    job_progress as _job_progress,
-    job_result as _job_result,
-    mark_job_failed as _mark_job_failed,
+    job_progress,
+    job_result,
+    mark_job_failed,
     method_key,
     row_hash,
     row_to_dict,
     rewrite_key,
     text_key,
-    update_job_progress as _update_job_progress,
+    update_job_progress,
     utc_now,
 )
 from search import REWRITE_PROMPT, VIEWS, RewriteResult, embed_texts, normalize_matrix, read_jsonl_list, rewrite_query
@@ -107,8 +107,8 @@ def recover_startup(settings: Settings) -> None:
         with conn:
             for row in running_jobs:
                 job = row_to_dict(row)
-                if _job_progress(job).get("cancel_requested"):
-                    result = _job_result(job)
+                if job_progress(job).get("cancel_requested"):
+                    result = job_result(job)
                     result["canceled"] = True
                     conn.execute(
                         """
@@ -152,10 +152,10 @@ def run_next_job(settings: Settings) -> bool:
         elif job["type"] == "build_index":
             execute_build_index_job(job["key"], settings)
         else:
-            _mark_job_failed(settings, job["key"], f"unsupported job type: {job['type']}")
+            mark_job_failed(settings, job["key"], f"unsupported job type: {job['type']}")
     except Exception as exc:
         append_job_log(settings, job["key"], "error", "Job failed", {"error": str(exc)})
-        _mark_job_failed(settings, job["key"], str(exc))
+        mark_job_failed(settings, job["key"], str(exc))
     return True
 
 
@@ -461,8 +461,8 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
         job = row_to_dict(row)
         if job["status"] != "queued":
             raise ValueError("import job is not queued")
-        if _job_progress(job).get("cancel_requested"):
-            return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
+        if job_progress(job).get("cancel_requested"):
+            return finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
         path = Path(payload["path"])
         mode = _validate_import_mode(str(payload["mode"]))
@@ -481,14 +481,14 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
 
     rows, errors = read_import_jsonl(path, settings)
     if errors:
-        _finish_job(settings, job_key, "failed", {"errors": errors}, "upload validation failed")
+        finish_job(settings, job_key, "failed", {"errors": errors}, "upload validation failed")
         raise ValueError("upload validation failed")
 
     stats = {"total": len(rows), "new": 0, "overwrite": 0, "skip": 0, "disabled": 0}
     row_keys_by_source: dict[str, set[str]] = {}
 
     for index, row in enumerate(rows, start=1):
-        if canceled := _finish_if_cancel_requested(settings, job_key, {"processed": index - 1, "total": len(rows)}):
+        if canceled := finish_if_cancel_requested(settings, job_key, {"processed": index - 1, "total": len(rows)}):
             return canceled
         row_keys_by_source.setdefault(row.source_key, set()).add(row.problem_key)
         now = utc_now()
@@ -560,7 +560,7 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                         )
 
         if index % 100 == 0 or index == len(rows):
-            _update_job_progress(
+            update_job_progress(
                 settings,
                 job_key,
                 {"phase": "importing", "processed": index, "total": len(rows)},
@@ -586,7 +586,7 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                     stats["disabled"] += cursor.rowcount
 
     path.unlink(missing_ok=True)
-    return _finish_job(settings, job_key, "succeeded", stats, None)
+    return finish_job(settings, job_key, "succeeded", stats, None)
 
 
 def ensure_rewrite_artifact(
@@ -1031,7 +1031,7 @@ def _ensure_rewrites_for_snapshot(
             "concurrency": max_workers if items else 0,
         },
     )
-    _update_job_progress(
+    update_job_progress(
         settings,
         job_key,
         {"phase": "rewrite", "processed": processed, "total": len(snapshot), "failures": 0},
@@ -1047,7 +1047,7 @@ def _ensure_rewrites_for_snapshot(
         items,
         rewrite_item,
         max_workers=max_workers,
-        cancel=lambda: _cancel_requested(settings, job_key),
+        cancel=lambda: cancel_requested(settings, job_key),
     ):
         if error is None and rewrite is not None:
             rewrite_by_text_key[text_key] = rewrite
@@ -1073,7 +1073,7 @@ def _ensure_rewrites_for_snapshot(
             )
 
         processed += len(problems)
-        _update_job_progress(
+        update_job_progress(
             settings,
             job_key,
             {
@@ -1099,8 +1099,8 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         job = row_to_dict(row)
         if job["status"] != "queued":
             raise ValueError("build job is not queued")
-        if _job_progress(job).get("cancel_requested"):
-            return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
+        if job_progress(job).get("cancel_requested"):
+            return finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
 
     with db_write_connection(settings) as conn:
@@ -1133,8 +1133,8 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         failed_problem_keys,
     )
     current_job = get_job(settings, job_key) or {}
-    current_progress = _job_progress(current_job)
-    if canceled := _finish_if_cancel_requested(
+    current_progress = job_progress(current_job)
+    if canceled := finish_if_cancel_requested(
         settings,
         job_key,
         {
@@ -1154,7 +1154,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             "Build index blocked after rewrite",
             {"failures": len(failures), "total": len(snapshot)},
         )
-        return _finish_job(settings, job_key, "blocked", {"failures": failures}, None)
+        return finish_job(settings, job_key, "blocked", {"failures": failures}, None)
 
     rewrite_keys = list(
         dict.fromkeys(rewrite_by_text_key[problem["text_key"]]["key"] for problem in snapshot)
@@ -1193,7 +1193,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             "concurrency": max(1, settings.jobs.embedding_concurrency),
         },
     )
-    _update_job_progress(
+    update_job_progress(
         settings,
         job_key,
         {
@@ -1231,7 +1231,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         batches,
         embed_batch,
         max_workers=max_workers,
-        cancel=lambda: _cancel_requested(settings, job_key),
+        cancel=lambda: cancel_requested(settings, job_key),
     ):
         if error is not None:
             message = str(error)
@@ -1266,7 +1266,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                     completed_rewrite_keys.add(item.rewrite_key)
 
         processed_embeddings += len(batch)
-        _update_job_progress(
+        update_job_progress(
             settings,
             job_key,
             {
@@ -1284,7 +1284,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             {"failures": failures} if failures else None,
         )
 
-    canceled = _finish_if_cancel_requested(
+    canceled = finish_if_cancel_requested(
         settings,
         job_key,
         {
@@ -1344,7 +1344,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             "Build index blocked",
             {"failures": len(failures), "total": len(snapshot)},
         )
-        return _finish_job(settings, job_key, "blocked", {"failures": failures}, None)
+        return finish_job(settings, job_key, "blocked", {"failures": failures}, None)
 
     rows, row_hashes = _build_index_rows(prepared)
     selected_index_key = index_key(
@@ -1425,7 +1425,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             "Build index succeeded",
             {"index_key": selected_index_key, "cache_path": str(cache_path)},
         )
-        return _finish_job(
+        return finish_job(
             settings,
             job_key,
             "succeeded",
@@ -1446,7 +1446,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             "Index export failed",
             {"index_key": selected_index_key, "error": str(exc)},
         )
-        return _finish_job(
+        return finish_job(
             settings,
             job_key,
             "failed",
