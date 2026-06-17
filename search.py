@@ -296,13 +296,35 @@ def _public_usage(value: Any) -> dict[str, Any]:
     }
 
 
+def _post_model_json(model_config: ModelConfig, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+    if not model_config.api_key:
+        raise ValueError(f"{model_config.api_key_env} is not configured")
+    response = requests.post(
+        model_config.resolved_url,
+        headers={
+            "Authorization": f"Bearer {model_config.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _payload_usage(payload: dict[str, Any], defaults: dict[str, Any] | None = None) -> dict[str, Any]:
+    usage = _public_usage(payload.get("usage"))
+    for key, value in (defaults or {}).items():
+        if isinstance(value, (str, int, float, bool)):
+            usage.setdefault(key, value)
+    return usage
+
+
 def rewrite_query_with_usage(
     model_config: ModelConfig,
     text: str,
     timeout: int = 240,
 ) -> RewriteCallResult:
-    if not model_config.api_key:
-        raise ValueError(f"{model_config.api_key_env} is not configured")
     request_body: dict[str, Any] = {
         "model": model_config.model,
         "messages": [
@@ -315,19 +337,9 @@ def rewrite_query_with_usage(
     }
     if model_config.provider:
         request_body["provider"] = model_config.provider
-    response = requests.post(
-        model_config.resolved_url,
-        headers={
-            "Authorization": f"Bearer {model_config.api_key}",
-            "Content-Type": "application/json",
-        },
-        json=request_body,
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    payload = _post_model_json(model_config, request_body, timeout)
     raw = payload["choices"][0]["message"]["content"]
-    return RewriteCallResult(parse_rewrite_output(raw), _public_usage(payload.get("usage")))
+    return RewriteCallResult(parse_rewrite_output(raw), _payload_usage(payload))
 
 
 def rewrite_query(model_config: ModelConfig, text: str, timeout: int = 240) -> RewriteResult:
@@ -339,31 +351,24 @@ def embed_texts_with_usage(
     texts: list[str],
     timeout: int = 240,
 ) -> EmbeddingCallResult:
-    if not model_config.api_key:
-        raise ValueError(f"{model_config.api_key_env} is not configured")
     if not texts:
         return EmbeddingCallResult(np.empty((0, 0), dtype=np.float32), {"input_count": 0})
 
-    response = requests.post(
-        model_config.resolved_url,
-        headers={
-            "Authorization": f"Bearer {model_config.api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
+    payload = _post_model_json(
+        model_config,
+        {
             "model": model_config.model,
             "input": texts,
             "encoding_format": "float",
         },
-        timeout=timeout,
+        timeout,
     )
-    response.raise_for_status()
-    payload: dict[str, Any] = response.json()
     data = sorted(payload["data"], key=lambda item: item["index"])
     vectors = np.array([item["embedding"] for item in data], dtype=np.float32)
-    usage = _public_usage(payload.get("usage"))
-    usage.setdefault("input_count", len(texts))
-    return EmbeddingCallResult(normalize_matrix(vectors), usage)
+    return EmbeddingCallResult(
+        normalize_matrix(vectors),
+        _payload_usage(payload, {"input_count": len(texts)}),
+    )
 
 
 def embed_texts(model_config: ModelConfig, texts: list[str], timeout: int = 240) -> np.ndarray:
@@ -376,33 +381,21 @@ def rerank_documents_with_usage(
     documents: list[str],
     timeout: int = 240,
 ) -> RerankCallResult:
-    if not model_config.api_key:
-        raise ValueError(f"{model_config.api_key_env} is not configured")
     if not documents:
         return RerankCallResult([], {"pair_count": 0})
 
-    response = requests.post(
-        model_config.resolved_url,
-        headers={
-            "Authorization": f"Bearer {model_config.api_key}",
-            "Content-Type": "application/json",
-        },
-        json={"queries": [query], "documents": documents},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    payload = _post_model_json(model_config, {"queries": [query], "documents": documents}, timeout)
     scores = payload.get("scores")
     if not isinstance(scores, list) or len(scores) != len(documents):
         raise ValueError(f"Unexpected reranker response: {payload}")
-    usage = _public_usage(payload.get("usage"))
-    if "input_tokens" in payload:
-        usage.setdefault("input_tokens", payload["input_tokens"])
+    input_tokens = payload.get("input_tokens")
     inference_status = payload.get("inference_status")
-    if isinstance(inference_status, dict) and "tokens_input" in inference_status:
-        usage.setdefault("input_tokens", inference_status["tokens_input"])
-    usage.setdefault("pair_count", len(documents))
-    return RerankCallResult([float(score) for score in scores], usage)
+    if input_tokens is None and isinstance(inference_status, dict):
+        input_tokens = inference_status.get("tokens_input")
+    return RerankCallResult(
+        [float(score) for score in scores],
+        _payload_usage(payload, {"input_tokens": input_tokens, "pair_count": len(documents)}),
+    )
 
 
 def rerank_documents(
