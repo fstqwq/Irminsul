@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Iterator, Literal, Sequence
 
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -552,43 +552,52 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
-def get_job(settings: Settings, job_key: str) -> dict[str, Any] | None:
+def db_one(settings: Settings, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
     with db_read_connection(settings) as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE key = ?", (job_key,)).fetchone()
+        row = conn.execute(sql, params).fetchone()
         return row_to_dict(row) if row else None
+
+
+def db_all(settings: Settings, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+    with db_read_connection(settings) as conn:
+        return [row_to_dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def db_exec(settings: Settings, sql: str, params: Sequence[Any] = ()) -> int:
+    with db_write_connection(settings) as conn:
+        with conn:
+            return conn.execute(sql, params).rowcount
+
+
+def db_exec_many(settings: Settings, statements: list[tuple[str, Sequence[Any]]]) -> None:
+    with db_write_connection(settings) as conn:
+        with conn:
+            for sql, params in statements:
+                conn.execute(sql, params)
+
+
+def get_job(settings: Settings, job_key: str) -> dict[str, Any] | None:
+    return db_one(settings, "SELECT * FROM jobs WHERE key = ?", (job_key,))
 
 
 def list_import_jobs(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
-    with db_read_connection(settings) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM jobs
-            WHERE type = 'import'
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [row_to_dict(row) for row in rows]
+    return db_all(
+        settings,
+        "SELECT * FROM jobs WHERE type = 'import' ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
 
 
 def list_indexes(settings: Settings, limit: int = 50) -> list[dict[str, Any]]:
-    with db_read_connection(settings) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM indexes
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [row_to_dict(row) for row in rows]
+    return db_all(
+        settings,
+        "SELECT * FROM indexes ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
 
 
 def get_index(settings: Settings, selected_index_key: str) -> dict[str, Any] | None:
-    with db_read_connection(settings) as conn:
-        row = conn.execute("SELECT * FROM indexes WHERE key = ?", (selected_index_key,)).fetchone()
-        return row_to_dict(row) if row else None
+    return db_one(settings, "SELECT * FROM indexes WHERE key = ?", (selected_index_key,))
 
 
 def delete_index(settings: Settings, index_key: str) -> dict[str, Any]:
@@ -870,30 +879,21 @@ def append_job_log(
     message: str,
     data: dict[str, Any] | None = None,
 ) -> None:
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO job_logs(job_key, level, message, data, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (job_key, level, message, json_dumps(data) if data is not None else None, utc_now()),
-            )
+    db_exec(
+        settings,
+        "INSERT INTO job_logs(job_key, level, message, data, created_at) VALUES (?, ?, ?, ?, ?)",
+        (job_key, level, message, json_dumps(data) if data is not None else None, utc_now()),
+    )
 
 
 def list_job_logs(settings: Settings, job_key: str, limit: int = 500) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 2000))
-    with db_read_connection(settings) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM job_logs
-            WHERE job_key = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (job_key, limit),
-        ).fetchall()
-    return list(reversed([row_to_dict(row) for row in rows]))
+    rows = db_all(
+        settings,
+        "SELECT * FROM job_logs WHERE job_key = ? ORDER BY id DESC LIMIT ?",
+        (job_key, limit),
+    )
+    return list(reversed(rows))
 
 
 def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
@@ -963,16 +963,12 @@ def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
 
 
 def mark_job_failed(settings: Settings, job_key: str, error: str) -> None:
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'failed', error = ?, updated_at = ?
-                WHERE key = ? AND status IN ('queued', 'running')
-                """,
-                (error[:4000], utc_now(), job_key),
-            )
+    db_exec(
+        settings,
+        "UPDATE jobs SET status = 'failed', error = ?, updated_at = ? "
+        "WHERE key = ? AND status IN ('queued', 'running')",
+        (error[:4000], utc_now(), job_key),
+    )
 
 
 def job_progress(job: dict[str, Any]) -> dict[str, Any]:
@@ -1054,16 +1050,11 @@ def finish_job(
     result: dict[str, Any],
     error: str | None,
 ) -> dict[str, Any]:
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = ?, result = ?, error = ?, updated_at = ?
-                WHERE key = ?
-                """,
-                (status, json_dumps(result), error, utc_now(), job_key),
-            )
+    db_exec(
+        settings,
+        "UPDATE jobs SET status = ?, result = ?, error = ?, updated_at = ? WHERE key = ?",
+        (status, json_dumps(result), error, utc_now(), job_key),
+    )
     job = get_job(settings, job_key)
     if job is None:
         raise ValueError("job not found after finish")

@@ -18,8 +18,9 @@ import requests
 from core import (
     ModelConfig,
     Settings,
+    db_exec,
+    db_one,
     db_read_connection,
-    db_write_connection,
     json_dumps,
     row_to_dict,
     utc_now,
@@ -822,31 +823,27 @@ def write_search_audit(
     error: str | None,
 ) -> None:
     finished_at = utc_now()
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO search_audits(
-                  request_id, started_at, finished_at, status, client_ip, user_agent,
-                  query, timings, api_calls, result, cost, error
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    request_id,
-                    started_at,
-                    finished_at,
-                    status,
-                    client_ip,
-                    user_agent,
-                    query,
-                    json_dumps(timings),
-                    json_dumps(api_calls),
-                    json_dumps(result),
-                    json_dumps(cost),
-                    error,
-                ),
-            )
+    db_exec(
+        settings,
+        "INSERT INTO search_audits("
+        "request_id, started_at, finished_at, status, client_ip, user_agent, "
+        "query, timings, api_calls, result, cost, error"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            request_id,
+            started_at,
+            finished_at,
+            status,
+            client_ip,
+            user_agent,
+            query,
+            json_dumps(timings),
+            json_dumps(api_calls),
+            json_dumps(result),
+            json_dumps(cost),
+            error,
+        ),
+    )
 
 
 def list_search_audits(
@@ -886,12 +883,7 @@ def list_search_audits(
 
 
 def get_search_audit(settings: Settings, request_id: str) -> dict[str, Any] | None:
-    with db_read_connection(settings) as conn:
-        row = conn.execute(
-            "SELECT * FROM search_audits WHERE request_id = ?",
-            (request_id,),
-        ).fetchone()
-    return row_to_dict(row) if row else None
+    return db_one(settings, "SELECT * FROM search_audits WHERE request_id = ?", (request_id,))
 
 
 def _audit_result_summary(candidates: list[Candidate]) -> dict[str, Any]:

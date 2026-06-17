@@ -11,7 +11,16 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 from app import create_app
-from core import db_read_connection, db_write_connection, ensure_database, get_settings, hash_password, text_key, utc_now
+from core import (
+    db_read_connection,
+    db_write_connection,
+    ensure_database,
+    get_settings,
+    hash_password,
+    text_key,
+    update_job_progress,
+    utc_now,
+)
 from search import IndexState, RewriteResult
 
 
@@ -353,8 +362,6 @@ def test_search_requires_active_index(monkeypatch) -> None:
 
 
 def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
-    import pipeline as pipeline_module
-
     base_settings = get_settings()
     storage = replace(
         base_settings.storage,
@@ -539,7 +546,7 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         assert running_cancel.json()["result"]["canceled"] is True
         assert running_cancel.json()["result"]["failures"][0]["problem_key"] == "QOJ/10202"
 
-        pipeline_module._update_job_progress(
+        update_job_progress(
             test_settings,
             "j:cancel-running",
             {"phase": "artifacts", "processed": 42, "total": 1223},

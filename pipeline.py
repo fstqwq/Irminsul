@@ -21,6 +21,7 @@ from core import (
     append_job_log,
     cancel_requested,
     canonical_text,
+    db_one,
     db_read_connection,
     db_write_connection,
     embedding_key,
@@ -815,9 +816,7 @@ def _load_embedding_artifacts_from_conn(
 
 
 def get_artifact(settings: Settings, artifact_key: str) -> dict[str, Any] | None:
-    with db_read_connection(settings) as conn:
-        row = conn.execute("SELECT * FROM artifacts WHERE key = ?", (artifact_key,)).fetchone()
-        return row_to_dict(row) if row else None
+    return db_one(settings, "SELECT * FROM artifacts WHERE key = ?", (artifact_key,))
 
 
 def _rewrite_payload(rewrite: RewriteResult, settings: Settings) -> dict[str, Any]:
