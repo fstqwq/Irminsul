@@ -6,11 +6,12 @@ import shutil
 import uuid
 import gc
 import threading
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import numpy as np
 
@@ -44,6 +45,40 @@ from search import REWRITE_PROMPT, VIEWS, RewriteResult, embed_texts, normalize_
 
 
 ImportMode = Literal["upsert", "insert_only", "sync_source"]
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def batch_process(
+    items: Sequence[T],
+    fn: Callable[[T], R],
+    max_workers: int = 1,
+    cancel: Callable[[], bool] | None = None,
+) -> Iterator[tuple[int, T, R | None, Exception | None]]:
+    if not items:
+        return
+    canceled = False
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        pending = {pool.submit(fn, item): (index, item) for index, item in enumerate(items)}
+        while pending:
+            try:
+                future = next(as_completed(pending, timeout=1.0))
+            except FuturesTimeoutError:
+                if cancel and cancel():
+                    canceled = True
+                    return
+                continue
+            index, item = pending.pop(future)
+            try:
+                yield index, item, future.result(), None
+            except Exception as exc:
+                yield index, item, None, exc
+            if cancel and cancel():
+                canceled = True
+                return
+    finally:
+        pool.shutdown(wait=not canceled, cancel_futures=canceled)
 
 
 class JobWorker:
@@ -653,10 +688,27 @@ def ensure_embedding_artifacts_bulk(
         selected_rewrite_keys,
         selected_method_key,
     )
-    _embed_pending_items(settings, pending_items)
-    if pending_items:
-        return _load_embedding_artifacts(settings, selected_rewrite_keys, selected_method_key)
-    return artifacts
+    if not pending_items:
+        return artifacts
+
+    batch_size = max(1, settings.jobs.embedding_batch_size)
+    for start in range(0, len(pending_items), batch_size):
+        batch = pending_items[start : start + batch_size]
+        batch_keys = [item.artifact_key for item in batch]
+        _mark_artifacts_running(settings, batch_keys)
+        try:
+            vectors = embed_texts(
+                settings.embedding_model,
+                [item.text for item in batch],
+                timeout=settings.request_timeout,
+            )
+            matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
+            _store_embedding_items_batch(settings, batch, matrix)
+        except Exception as exc:
+            for key in batch_keys:
+                _mark_artifact_failed(settings, key, str(exc))
+            raise
+    return _load_embedding_artifacts(settings, selected_rewrite_keys, selected_method_key)
 
 
 def _prepare_embedding_work(
@@ -728,26 +780,6 @@ def _prepare_embedding_work(
                     )
                 )
     return artifacts, pending_items
-
-
-def _embed_pending_items(settings: Settings, pending_items: list[EmbeddingWorkItem]) -> None:
-    batch_size = max(1, settings.jobs.embedding_batch_size)
-    for start in range(0, len(pending_items), batch_size):
-        batch = pending_items[start : start + batch_size]
-        batch_keys = [item.artifact_key for item in batch]
-        _mark_artifacts_running(settings, batch_keys)
-        try:
-            vectors = embed_texts(
-                settings.embedding_model,
-                [item.text for item in batch],
-                timeout=settings.request_timeout,
-            )
-            matrix = normalize_matrix(np.asarray(vectors, dtype=np.float32))
-            _store_embedding_items_batch(settings, batch, matrix)
-        except Exception as exc:
-            for key in batch_keys:
-                _mark_artifact_failed(settings, key, str(exc))
-            raise
 
 
 def _load_embedding_artifacts(
@@ -1007,101 +1039,53 @@ def _ensure_rewrites_for_snapshot(
     if not items:
         return rewrite_by_text_key
 
-    canceled = False
-    item_index = 0
-    futures: dict[Future[dict[str, Any]], str] = {}
-    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yuantiji-rewrite")
+    def rewrite_item(item: tuple[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        text_key, _ = item
+        return ensure_rewrite_artifact(settings, text_key, selected_method_key)
 
-    def submit_until_full() -> None:
-        nonlocal item_index
-        while len(futures) < max_workers and item_index < len(items):
-            text_key, _ = items[item_index]
-            item_index += 1
-            futures[pool.submit(ensure_rewrite_artifact, settings, text_key, selected_method_key)] = text_key
-
-    try:
-        submit_until_full()
-        while futures:
-            if _cancel_requested(settings, job_key):
-                canceled = True
-                break
-
-            done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
-            if not done:
-                continue
-
-            for future in done:
-                text_key = futures.pop(future)
-                problems = grouped[text_key]
-                try:
-                    rewrite_by_text_key[text_key] = future.result()
-                except Exception as exc:
-                    error = str(exc)
-                    for problem in problems:
-                        _record_problem_failure(
-                            failures,
-                            failed_problem_keys,
-                            problem,
-                            "rewrite",
-                            error,
-                        )
-                    append_job_log(
-                        settings,
-                        job_key,
-                        "error",
-                        "Rewrite failed",
-                        {
-                            "problem_keys": [problem["key"] for problem in problems],
-                            "error": error,
-                        },
-                    )
-
-                processed += len(problems)
-                _update_job_progress(
-                    settings,
-                    job_key,
-                    {
-                        "phase": "rewrite",
-                        "processed": processed,
-                        "total": len(snapshot),
-                        "failures": len(failures),
-                    },
-                    {"failures": failures} if failures else None,
-                )
-
-            if _cancel_requested(settings, job_key):
-                canceled = True
-                break
-            submit_until_full()
-    finally:
-        if canceled:
-            for future in futures:
-                future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
+    for _, (text_key, problems), rewrite, error in batch_process(
+        items,
+        rewrite_item,
+        max_workers=max_workers,
+        cancel=lambda: _cancel_requested(settings, job_key),
+    ):
+        if error is None and rewrite is not None:
+            rewrite_by_text_key[text_key] = rewrite
         else:
-            pool.shutdown(wait=True)
+            message = str(error)
+            for problem in problems:
+                _record_problem_failure(
+                    failures,
+                    failed_problem_keys,
+                    problem,
+                    "rewrite",
+                    message,
+                )
+            append_job_log(
+                settings,
+                job_key,
+                "error",
+                "Rewrite failed",
+                {
+                    "problem_keys": [problem["key"] for problem in problems],
+                    "error": message,
+                },
+            )
+
+        processed += len(problems)
+        _update_job_progress(
+            settings,
+            job_key,
+            {
+                "phase": "rewrite",
+                "processed": processed,
+                "total": len(snapshot),
+                "failures": len(failures),
+            },
+            {"failures": failures} if failures else None,
+        )
 
     return rewrite_by_text_key
-
-
-def _problem_count_for_rewrites(
-    rewrite_keys: set[str],
-    problems_by_rewrite_key: dict[str, list[dict[str, Any]]],
-) -> int:
-    return sum(len(problems_by_rewrite_key.get(rewrite_key, [])) for rewrite_key in rewrite_keys)
-
-
-def _problem_progress(
-    completed_rewrite_keys: set[str],
-    problems_by_rewrite_key: dict[str, list[dict[str, Any]]],
-    failed_problem_keys: set[str],
-    total: int,
-) -> int:
-    return min(
-        total,
-        _problem_count_for_rewrites(completed_rewrite_keys, problems_by_rewrite_key)
-        + len(failed_problem_keys),
-    )
 
 
 def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
@@ -1214,11 +1198,10 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         job_key,
         {
             "phase": "embedding",
-            "processed": _problem_progress(
-                completed_rewrite_keys,
-                problems_by_rewrite_key,
-                failed_problem_keys,
+            "processed": min(
                 len(snapshot),
+                sum(len(problems_by_rewrite_key.get(key, [])) for key in completed_rewrite_keys)
+                + len(failed_problem_keys),
             ),
             "total": len(snapshot),
             "failures": 0,
@@ -1230,10 +1213,7 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     processed_embeddings = 0
     batch_size = max(1, settings.jobs.embedding_batch_size)
     batches = [pending_items[start : start + batch_size] for start in range(0, len(pending_items), batch_size)]
-    max_workers = max(1, min(settings.jobs.embedding_concurrency, max(1, len(batches))))
-    batch_index = 0
-    canceled = False
-    futures: dict[Future[list[EmbeddingWorkItem]], list[EmbeddingWorkItem]] = {}
+    max_workers = max(1, min(settings.jobs.embedding_concurrency, len(batches)))
 
     def embed_batch(batch: list[EmbeddingWorkItem]) -> list[EmbeddingWorkItem]:
         batch_keys = [item.artifact_key for item in batch]
@@ -1247,105 +1227,79 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         _store_embedding_items_batch(settings, batch, matrix)
         return batch
 
-    def submit_until_full(pool: ThreadPoolExecutor) -> None:
-        nonlocal batch_index
-        while len(futures) < max_workers and batch_index < len(batches):
-            batch = batches[batch_index]
-            batch_index += 1
-            futures[pool.submit(embed_batch, batch)] = batch
-
-    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yuantiji-embedding")
-    try:
-        submit_until_full(pool)
-        while futures:
-            if canceled := _finish_if_cancel_requested(
+    for _, batch, completed_batch, error in batch_process(
+        batches,
+        embed_batch,
+        max_workers=max_workers,
+        cancel=lambda: _cancel_requested(settings, job_key),
+    ):
+        if error is not None:
+            message = str(error)
+            batch_keys = [item.artifact_key for item in batch]
+            for key in batch_keys:
+                _mark_artifact_failed(settings, key, message)
+            affected_rewrite_keys = sorted({item.rewrite_key for item in batch})
+            for rewrite_key_value in affected_rewrite_keys:
+                for problem in problems_by_rewrite_key.get(rewrite_key_value, []):
+                    _record_problem_failure(
+                        failures,
+                        failed_problem_keys,
+                        problem,
+                        "embedding",
+                        message,
+                    )
+            append_job_log(
                 settings,
                 job_key,
+                "error",
+                "Embedding batch failed",
                 {
-                    "phase": "embedding",
-                    "failures": failures,
-                    "processed": _problem_progress(
-                        completed_rewrite_keys,
-                        problems_by_rewrite_key,
-                        failed_problem_keys,
-                        len(snapshot),
-                    ),
-                    "total": len(snapshot),
-                    "processed_embeddings": processed_embeddings,
-                    "total_embeddings": len(pending_items),
+                    "rewrite_keys": affected_rewrite_keys,
+                    "artifacts": len(batch),
+                    "error": message,
                 },
-            ):
-                break
-
-            done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
-            if not done:
-                continue
-
-            for future in done:
-                batch = futures.pop(future)
-                batch_keys = [item.artifact_key for item in batch]
-                try:
-                    future.result()
-                except Exception as exc:
-                    error = str(exc)
-                    for key in batch_keys:
-                        _mark_artifact_failed(settings, key, error)
-                    affected_rewrite_keys = sorted({item.rewrite_key for item in batch})
-                    for rewrite_key_value in affected_rewrite_keys:
-                        for problem in problems_by_rewrite_key.get(rewrite_key_value, []):
-                            _record_problem_failure(
-                                failures,
-                                failed_problem_keys,
-                                problem,
-                                "embedding",
-                                error,
-                            )
-                    append_job_log(
-                        settings,
-                        job_key,
-                        "error",
-                        "Embedding batch failed",
-                        {
-                            "rewrite_keys": affected_rewrite_keys,
-                            "artifacts": len(batch),
-                            "error": error,
-                        },
-                    )
-                else:
-                    for item in batch:
-                        embedding_counts[item.rewrite_key] = embedding_counts.get(item.rewrite_key, 0) + 1
-                        if embedding_counts[item.rewrite_key] == len(VIEWS):
-                            completed_rewrite_keys.add(item.rewrite_key)
-
-                processed_embeddings += len(batch)
-                _update_job_progress(
-                    settings,
-                    job_key,
-                    {
-                        "phase": "embedding",
-                        "processed": _problem_progress(
-                            completed_rewrite_keys,
-                            problems_by_rewrite_key,
-                            failed_problem_keys,
-                            len(snapshot),
-                        ),
-                        "total": len(snapshot),
-                        "failures": len(failures),
-                        "processed_embeddings": processed_embeddings,
-                        "total_embeddings": len(pending_items),
-                    },
-                    {"failures": failures} if failures else None,
-                )
-
-            submit_until_full(pool)
-    finally:
-        if canceled:
-            for future in futures:
-                future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
+            )
         else:
-            pool.shutdown(wait=True)
+            for item in completed_batch or []:
+                embedding_counts[item.rewrite_key] = embedding_counts.get(item.rewrite_key, 0) + 1
+                if embedding_counts[item.rewrite_key] == len(VIEWS):
+                    completed_rewrite_keys.add(item.rewrite_key)
 
+        processed_embeddings += len(batch)
+        _update_job_progress(
+            settings,
+            job_key,
+            {
+                "phase": "embedding",
+                "processed": min(
+                    len(snapshot),
+                    sum(len(problems_by_rewrite_key.get(key, [])) for key in completed_rewrite_keys)
+                    + len(failed_problem_keys),
+                ),
+                "total": len(snapshot),
+                "failures": len(failures),
+                "processed_embeddings": processed_embeddings,
+                "total_embeddings": len(pending_items),
+            },
+            {"failures": failures} if failures else None,
+        )
+
+    canceled = _finish_if_cancel_requested(
+        settings,
+        job_key,
+        {
+            "phase": "embedding",
+            "failures": failures,
+            "processed": min(
+                len(snapshot),
+                sum(len(problems_by_rewrite_key.get(key, [])) for key in completed_rewrite_keys)
+                + len(failed_problem_keys),
+            ),
+            "total": len(snapshot),
+            "processed_embeddings": processed_embeddings,
+            "total_embeddings": len(pending_items),
+        },
+    )
     if canceled:
         return canceled
 
