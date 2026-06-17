@@ -683,16 +683,11 @@ def ensure_rewrite_artifact(
             timeout=settings.request_timeout,
         )
         payload = _rewrite_payload(rewrite, settings)
-        with db_write_connection(settings) as conn:
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE artifacts
-                    SET status = 'succeeded', data = ?, error = NULL, updated_at = ?
-                    WHERE key = ?
-                    """,
-                    (json_dumps(payload), utc_now(), selected_rewrite_key),
-                )
+        db_exec(
+            settings,
+            "UPDATE artifacts SET status = 'succeeded', data = ?, error = NULL, updated_at = ? WHERE key = ?",
+            (json_dumps(payload), utc_now(), selected_rewrite_key),
+        )
         artifact = get_artifact(settings, selected_rewrite_key)
         if artifact is None:
             raise ValueError("rewrite artifact disappeared")
@@ -937,21 +932,20 @@ def create_build_index_job(settings: Settings) -> dict[str, Any]:
         "embedding_method": _model_snapshot(settings, "embedding"),
         "problem_count": len(snapshot),
     }
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
-                VALUES (?, 'build_index', 'queued', ?, ?, ?, ?)
-                """,
-                (
-                    job_key,
-                    json_dumps(payload),
-                    json_dumps({"phase": "queued", "total": len(snapshot)}),
-                    now,
-                    now,
-                ),
-            )
+    db_exec(
+        settings,
+        """
+        INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+        VALUES (?, 'build_index', 'queued', ?, ?, ?, ?)
+        """,
+        (
+            job_key,
+            json_dumps(payload),
+            json_dumps({"phase": "queued", "total": len(snapshot)}),
+            now,
+            now,
+        ),
+    )
     job = get_job(settings, job_key)
     if job is None:
         raise ValueError("build job was not created")
@@ -1380,16 +1374,11 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
     try:
         export_index_cache(settings, selected_index_key, prepared, cache_path)
         verify_index_cache(cache_path, selected_index_key)
-        with db_write_connection(settings) as conn:
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE indexes
-                    SET status = 'built', error = NULL
-                    WHERE key = ?
-                    """,
-                    (selected_index_key,),
-                )
+        db_exec(
+            settings,
+            "UPDATE indexes SET status = 'built', error = NULL WHERE key = ?",
+            (selected_index_key,),
+        )
         job_ctx.info(
             "Build index succeeded",
             {"index_key": selected_index_key, "cache_path": str(cache_path)},
@@ -1400,12 +1389,11 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
             None,
         )
     except Exception as exc:
-        with db_write_connection(settings) as conn:
-            with conn:
-                conn.execute(
-                    "UPDATE indexes SET status = 'failed', error = ? WHERE key = ?",
-                    (str(exc), selected_index_key),
-                )
+        db_exec(
+            settings,
+            "UPDATE indexes SET status = 'failed', error = ? WHERE key = ?",
+            (str(exc), selected_index_key),
+        )
         job_ctx.error(
             "Index export failed",
             {"index_key": selected_index_key, "error": str(exc)},
@@ -1538,16 +1526,11 @@ def rebuild_index_cache(settings: Settings, selected_index_key: str) -> dict[str
     cache_path = index_cache_path(settings, selected_index_key)
     export_index_cache(settings, selected_index_key, prepared, cache_path, force=True)
     verify_index_cache(cache_path, selected_index_key)
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                UPDATE indexes
-                SET status = 'built', error = NULL
-                WHERE key = ?
-                """,
-                (selected_index_key,),
-            )
+    db_exec(
+        settings,
+        "UPDATE indexes SET status = 'built', error = NULL WHERE key = ?",
+        (selected_index_key,),
+    )
     refreshed = get_index(settings, selected_index_key)
     if refreshed is None:
         raise ValueError("index not found after cache rebuild")
