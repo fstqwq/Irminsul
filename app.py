@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -401,13 +401,10 @@ def create_app() -> FastAPI:
         _clear_session_cookies(response)
         return {"ok": True}
 
-    @app.get("/admin/api/auth/me")
-    def me(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        return {"authenticated": True, "sub": session["sub"], "exp": session["exp"]}
+    admin_router = APIRouter(prefix="/admin/api", dependencies=[Depends(require_admin)])
 
-    @app.get("/admin/api/dashboard")
-    def dashboard(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
+    @admin_router.get("/dashboard")
+    def dashboard() -> dict[str, Any]:
         current_settings = settings()
         selected_rewrite_method_key = rewrite_method_key(current_settings)
         selected_embedding_method_key = embedding_method_key(current_settings)
@@ -493,7 +490,7 @@ def create_app() -> FastAPI:
             "today_searches": today_searches,
         }
 
-    @app.get("/admin/api/problems")
+    @admin_router.get("/problems")
     def problems(
         source_key: str | None = None,
         enabled: bool | None = None,
@@ -501,70 +498,57 @@ def create_app() -> FastAPI:
         q: str = "",
         limit: int = 50,
         offset: int = 0,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         return list_problems(settings(), source_key, enabled, deleted, q, limit, offset)
 
-    @app.post("/admin/api/problems/batch-{action}")
+    @admin_router.post("/problems/batch-{action}")
     def problems_batch(
         action: str,
         payload: ProblemBatchRequest,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return batch_update_problems(settings(), payload.keys, action)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/admin/api/problems/{problem_key:path}")
+    @admin_router.get("/problems/{problem_key:path}")
     def problem_detail(
         problem_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         problem = get_problem(settings(), problem_key)
         if problem is None:
             raise HTTPException(status_code=404, detail="Problem not found")
         return problem
 
-    @app.patch("/admin/api/problems/{problem_key:path}")
+    @admin_router.patch("/problems/{problem_key:path}")
     def problem_patch(
         problem_key: str,
         payload: ProblemPatch,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return patch_problem(settings(), problem_key, payload.model_dump(exclude_unset=True))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/admin/api/sources")
-    def sources(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
+    @admin_router.get("/sources")
+    def sources() -> dict[str, Any]:
         return {"items": list_sources(settings())}
 
-    @app.patch("/admin/api/sources/{source_key}")
+    @admin_router.patch("/sources/{source_key}")
     def source_patch(
         source_key: str,
         payload: SourcePatch,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return patch_source(settings(), source_key, payload.model_dump(exclude_unset=True))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/import/dry-run")
+    @admin_router.post("/import/dry-run")
     async def import_dry_run(
         file: UploadFile = File(...),
         mode: str = Form("upsert"),
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         current_settings = settings()
         path = await _store_upload(file, current_settings)
         try:
@@ -573,23 +557,19 @@ def create_app() -> FastAPI:
             path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/import/{job_key}/confirm")
+    @admin_router.post("/import/{job_key}/confirm")
     def import_confirm(
         job_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return _decode_json_fields(confirm_import_job(job_key, settings()), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.delete("/admin/api/import/{job_key}")
+    @admin_router.delete("/import/{job_key}")
     def import_delete(
         job_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return {
                 "deleted": _decode_json_fields(
@@ -604,9 +584,8 @@ def create_app() -> FastAPI:
             status_code = 404 if "not found" in detail else 400
             raise HTTPException(status_code=status_code, detail=detail) from exc
 
-    @app.get("/admin/api/imports")
-    def imports(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
+    @admin_router.get("/imports")
+    def imports() -> dict[str, Any]:
         return {
             "items": [
                 _decode_json_fields(job, "payload", "progress", "result")
@@ -614,25 +593,21 @@ def create_app() -> FastAPI:
             ]
         }
 
-    @app.get("/admin/api/imports/{job_key}")
+    @admin_router.get("/imports/{job_key}")
     def import_detail(
         job_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         job = get_job(settings(), job_key)
         if job is None or job["type"] != "import":
             raise HTTPException(status_code=404, detail="Import job not found")
         return _decode_json_fields(job, "payload", "progress", "result")
 
-    @app.get("/admin/api/jobs")
+    @admin_router.get("/jobs")
     def jobs(
         type: str | None = None,
         status: str | None = None,
         limit: int = 50,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         return {
             "items": [
                 _decode_json_fields(job, "payload", "progress", "result")
@@ -640,12 +615,10 @@ def create_app() -> FastAPI:
             ]
         }
 
-    @app.get("/admin/api/jobs/{job_key}")
+    @admin_router.get("/jobs/{job_key}")
     def job_detail(
         job_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         job = get_job(settings(), job_key)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -654,69 +627,57 @@ def create_app() -> FastAPI:
         decoded["logs"] = logs
         return decoded
 
-    @app.post("/admin/api/jobs/{job_key}/retry")
+    @admin_router.post("/jobs/{job_key}/retry")
     def job_retry(
         job_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return _decode_json_fields(retry_job(settings(), job_key), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/jobs/{job_key}/cancel")
+    @admin_router.post("/jobs/{job_key}/cancel")
     def job_cancel(
         job_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return _decode_json_fields(cancel_job(settings(), job_key), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/index/build")
-    def index_build(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
+    @admin_router.post("/index/build")
+    def index_build() -> dict[str, Any]:
         try:
             return _decode_json_fields(create_build_index_job(settings()), "payload", "progress", "result")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/admin/api/indexes")
-    def indexes(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
+    @admin_router.get("/indexes")
+    def indexes() -> dict[str, Any]:
         return {"items": [_decode_json_fields(index, "meta") for index in list_indexes(settings())]}
 
-    @app.get("/admin/api/indexes/{index_key}")
+    @admin_router.get("/indexes/{index_key}")
     def index_detail(
         index_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         index = get_index(settings(), index_key)
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")
         return _decode_json_fields(index, "meta")
 
-    @app.delete("/admin/api/indexes/{index_key}")
+    @admin_router.delete("/indexes/{index_key}")
     def index_delete(
         index_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return _decode_json_fields(delete_index(settings(), index_key), "meta")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/index/{index_key}/activate")
+    @admin_router.post("/index/{index_key}/activate")
     def index_activate(
         index_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             _activate_index(settings(), index_key, index_state())
         except ValueError as exc:
@@ -726,39 +687,33 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Index not found")
         return _decode_json_fields(index, "meta")
 
-    @app.post("/admin/api/index/{index_key}/cache/rebuild")
+    @admin_router.post("/index/{index_key}/cache/rebuild")
     def index_cache_rebuild(
         index_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             return _decode_json_fields(rebuild_index_cache(settings(), index_key), "meta")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/index/{index_key}/verify")
+    @admin_router.post("/index/{index_key}/verify")
     def index_verify(
         index_key: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         try:
             verify_index_cache(index_cache_path(settings(), index_key), index_key)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "index_key": index_key}
 
-    @app.get("/admin/api/audits")
+    @admin_router.get("/audits")
     def audits(
         status: str | None = None,
         q: str = "",
         date_from: str = "",
         date_to: str = "",
         limit: int = 50,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         return {
             "items": [
                 _decode_json_fields(audit, "timings", "api_calls", "result", "cost")
@@ -773,20 +728,17 @@ def create_app() -> FastAPI:
             ]
         }
 
-    @app.get("/admin/api/audits/{request_id}")
+    @admin_router.get("/audits/{request_id}")
     def audit_detail(
         request_id: str,
-        session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
-        del session
         audit = get_search_audit(settings(), request_id)
         if audit is None:
             raise HTTPException(status_code=404, detail="Audit not found")
         return _decode_json_fields(audit, "timings", "api_calls", "result", "cost")
 
-    @app.get("/admin/api/settings")
-    def admin_settings(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
+    @admin_router.get("/settings")
+    def admin_settings() -> dict[str, Any]:
         current_settings = settings()
         return {
             "storage": {
@@ -820,6 +772,8 @@ def create_app() -> FastAPI:
             "search": current_settings.search.__dict__,
             "index_cache": current_settings.index_cache.__dict__,
         }
+
+    app.include_router(admin_router)
 
     frontend_dist = SRC_DIR / "frontend" / "dist"
     if frontend_dist.exists():

@@ -58,6 +58,12 @@ const state: AdminState = {
 let rootEl: HTMLElement;
 let refreshTimer: number | null = null;
 
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 export function startAdmin(root: HTMLElement): void {
   rootEl = root;
   window.addEventListener("hashchange", () => {
@@ -66,7 +72,9 @@ export function startAdmin(root: HTMLElement): void {
     state.notice = "";
     void loadPage();
   });
-  void checkSession();
+  state.page = pageFromHash();
+  state.authenticated = true;
+  void loadPage();
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -78,27 +86,12 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const text = await response.text();
     let message = text || `Request failed (${response.status})`;
     try { message = String((JSON.parse(text) as Row).detail || message); } catch { /* keep plain text */ }
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   return response.json() as Promise<T>;
 }
 
-async function checkSession(): Promise<void> {
-  state.loading = true;
-  render();
-  try {
-    await api("/admin/api/auth/me");
-    state.authenticated = true;
-    await loadPage();
-  } catch {
-    state.authenticated = false;
-    state.loading = false;
-    render();
-  }
-}
-
 async function loadPage(options: { silent?: boolean } = {}): Promise<void> {
-  if (!state.authenticated) return render();
   if (!options.silent) { state.loading = true; render(); }
   state.error = "";
   try {
@@ -118,8 +111,14 @@ async function loadPage(options: { silent?: boolean } = {}): Promise<void> {
       settings: () => api("/admin/api/settings")
     };
     state.data[state.page] = await loaders[state.page]();
+    state.authenticated = true;
   } catch (error) {
-    state.error = (error as Error).message;
+    if (error instanceof ApiError && error.status === 401) {
+      state.authenticated = false;
+      state.error = "";
+    } else {
+      state.error = (error as Error).message;
+    }
   } finally {
     if (!options.silent) state.loading = false;
     render();

@@ -260,7 +260,7 @@ POST /api/search        NDJSON stream
 
 | 分组 | 端点 |
 |------|------|
-| Auth | `POST /auth/login` · `POST /auth/logout` · `GET /auth/me` |
+| Auth | `POST /auth/login` · `POST /auth/logout` |
 | Dashboard | `GET /dashboard` |
 | Problems | `GET /problems` · `GET /problems/{key}` · `PATCH /problems/{key}` · `POST /problems/batch-{action}` |
 | Sources | `GET /sources` · `PATCH /sources/{key}` |
