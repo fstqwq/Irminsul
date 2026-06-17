@@ -1560,11 +1560,13 @@ def rebuild_index_cache(settings: Settings, selected_index_key: str) -> dict[str
     cache_path = index_cache_path(settings, selected_index_key)
     export_index_cache(settings, selected_index_key, prepared, cache_path, force=True)
     verify_index_cache(cache_path, selected_index_key)
-    db_exec(
+    rowcount = db_exec(
         settings,
-        "UPDATE indexes SET status = 'built', error = NULL WHERE key = ?",
+        "UPDATE indexes SET status = 'built', error = NULL WHERE key = ? AND status != 'active'",
         (selected_index_key,),
     )
+    if rowcount == 0:
+        raise ValueError("index state changed during cache rebuild")
     refreshed = get_index(settings, selected_index_key)
     if refreshed is None:
         raise ValueError("index not found after cache rebuild")

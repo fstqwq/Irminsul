@@ -23,7 +23,6 @@ from core import (
     Settings,
     batch_update_problems,
     cancel_job,
-    db_exec_many,
     db_read_connection,
     db_write_connection,
     delete_index,
@@ -251,21 +250,27 @@ def _activate_index(current_settings: Settings, selected_index_key: str, state: 
     )
     state.activate(loaded, current_settings.index_cache.activation_drain_timeout_seconds)
     now = utc_now()
-    db_exec_many(
-        current_settings,
-        [
-            ("UPDATE indexes SET status = 'retired' WHERE status = 'active'", ()),
-            (
-                "UPDATE indexes SET status = 'active', activated_at = ?, error = NULL WHERE key = ?",
+    with db_write_connection(current_settings) as conn:
+        with conn:
+            conn.execute(
+                "UPDATE indexes SET status = 'retired' WHERE status = 'active' AND key != ?",
+                (selected_index_key,),
+            )
+            cursor = conn.execute(
+                """
+                UPDATE indexes
+                SET status = 'active', activated_at = ?, error = NULL
+                WHERE key = ? AND status IN ('built', 'active', 'retired')
+                """,
                 (now, selected_index_key),
-            ),
-            (
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("index is not built")
+            conn.execute(
                 "INSERT INTO kv(key, value, updated_at) VALUES ('active_index_key', ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 (selected_index_key, now),
-            ),
-        ],
-    )
+            )
 
 
 def _decode_json_fields(row: dict[str, Any], *fields: str) -> dict[str, Any]:

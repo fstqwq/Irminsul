@@ -888,12 +888,17 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
         raise ValueError("job not found")
     if job["status"] not in {"blocked", "failed"}:
         raise ValueError("job is not retryable")
-    db_exec(
+    rowcount = db_exec(
         settings,
         "UPDATE jobs SET status = 'queued', progress = ?, result = NULL, error = NULL, updated_at = ? "
-        "WHERE key = ?",
+        "WHERE key = ? AND status IN ('blocked', 'failed')",
         (json_dumps({"phase": "queued"}), utc_now(), job_key),
     )
+    if rowcount == 0:
+        current = get_job(settings, job_key)
+        if current is None:
+            raise ValueError("job not found")
+        raise ValueError("job is not retryable")
     append_job_log(settings, job_key, "info", "Job queued for retry")
     return get_job(settings, job_key) or job
 

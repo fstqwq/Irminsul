@@ -8,8 +8,19 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from core import db_read_connection, db_write_connection, ensure_database, get_settings, text_key, utc_now
+from core import (
+    db_exec,
+    db_read_connection,
+    db_write_connection,
+    ensure_database,
+    get_settings,
+    list_job_logs,
+    retry_job,
+    text_key,
+    utc_now,
+)
 from pipeline import (
     create_build_index_job,
     embedding_method_key,
@@ -222,6 +233,34 @@ def test_run_next_job_does_not_double_claim(monkeypatch, tmp_path: Path) -> None
     assert calls == [("j:single", True)]
 
 
+def test_retry_job_requires_compare_and_swap(monkeypatch, tmp_path: Path) -> None:
+    settings = _temp_settings(tmp_path)
+    ensure_database(settings)
+    now = utc_now()
+    with db_write_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                VALUES ('j:retry', 'import', 'blocked', '{}', '{"phase":"blocked"}', ?, ?)
+                """,
+                (now, now),
+            )
+
+    def miss_retry_update(current_settings, sql, params=()):
+        del sql, params
+        with db_write_connection(current_settings) as conn:
+            with conn:
+                conn.execute("UPDATE jobs SET status = 'running' WHERE key = 'j:retry'")
+        return 0
+
+    monkeypatch.setattr("core.db_exec", miss_retry_update)
+
+    with pytest.raises(ValueError, match="not retryable"):
+        retry_job(settings, "j:retry")
+    assert list_job_logs(settings, "j:retry") == []
+
+
 def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
     settings = _temp_settings(tmp_path)
     ensure_database(settings)
@@ -306,6 +345,15 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
     rebuilt = rebuild_index_cache(settings, index_key)
     assert rebuilt["status"] == "built"
     assert np.load(cache_path / "statement.npy", mmap_mode="r").shape == (1, 2)
+
+    def miss_rebuild_update(current_settings, sql, params=()):
+        if sql.startswith("UPDATE indexes SET status = 'built'"):
+            return 0
+        return db_exec(current_settings, sql, params)
+
+    monkeypatch.setattr("pipeline.db_exec", miss_rebuild_update)
+    with pytest.raises(ValueError, match="state changed"):
+        rebuild_index_cache(settings, index_key)
 
 
 def test_build_index_rewrites_all_problems_before_embedding(monkeypatch, tmp_path: Path) -> None:
