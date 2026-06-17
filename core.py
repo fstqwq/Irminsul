@@ -5,10 +5,10 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import threading
 import tomllib
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -129,7 +129,6 @@ class SearchConfig:
 
 @dataclass(frozen=True)
 class IndexCacheConfig:
-    keep_retired: int
     load_mode: str
     activation_drain_timeout_seconds: int
 
@@ -254,7 +253,6 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
             embedding_range_floor=float(search.get("embedding_range_floor", 0.05)),
         ),
         index_cache=IndexCacheConfig(
-            keep_retired=int(index_cache.get("keep_retired", 3)),
             load_mode=str(index_cache.get("load_mode", "mmap")),
             activation_drain_timeout_seconds=int(
                 index_cache.get("activation_drain_timeout_seconds", 30)
@@ -375,21 +373,12 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=60.0)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
-
-
-@contextmanager
-def db_connection(settings: Settings) -> Iterator[sqlite3.Connection]:
-    conn = connect_db(settings.storage.db_path)
-    try:
-        yield conn
-    finally:
-        conn.close()
 
 
 @contextmanager
@@ -417,17 +406,14 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version > SCHEMA_VERSION:
         raise RuntimeError(f"Database schema is newer than this application: {version}")
     if version == 0:
-        _migrate_0_to_1(conn)
-        version = 1
-    if version == 1:
-        _migrate_1_to_2(conn)
-        version = 2
+        _create_schema(conn)
+        return
     if version != SCHEMA_VERSION:
         raise RuntimeError(f"Unsupported database schema version: {version}")
 
 
 def ensure_database(settings: Settings) -> None:
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         migrate(conn)
         ensure_query_indexes(conn)
 
@@ -448,7 +434,7 @@ def ensure_query_indexes(conn: sqlite3.Connection) -> None:
         )
 
 
-def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
+def _create_schema(conn: sqlite3.Connection) -> None:
     with conn:
         conn.executescript(
             """
@@ -469,7 +455,6 @@ def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
               data TEXT,
               blob BLOB,
               status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed')),
-              attempts INTEGER NOT NULL DEFAULT 0,
               error TEXT,
               updated_at TEXT NOT NULL,
               UNIQUE(kind, parent_key, method_key, role)
@@ -512,7 +497,7 @@ def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
 
             CREATE TABLE jobs (
               key TEXT PRIMARY KEY,
-              type TEXT NOT NULL CHECK(type IN ('import','build_index','activate_index','cleanup')),
+              type TEXT NOT NULL CHECK(type IN ('import','build_index','activate_index')),
               status TEXT NOT NULL CHECK(status IN ('draft','queued','running','succeeded','blocked','failed')),
               payload TEXT NOT NULL,
               progress TEXT NOT NULL,
@@ -520,6 +505,15 @@ def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
               error TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE job_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_key TEXT NOT NULL REFERENCES jobs(key) ON DELETE CASCADE,
+              level TEXT NOT NULL CHECK(level IN ('info','warning','error')),
+              message TEXT NOT NULL,
+              data TEXT,
+              created_at TEXT NOT NULL
             );
 
             CREATE TABLE search_audits (
@@ -546,28 +540,8 @@ def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
             CREATE INDEX idx_problems_filter ON problems(source_key, enabled, deleted);
             CREATE INDEX idx_artifacts_lookup ON artifacts(kind, parent_key, method_key, role, status);
             CREATE INDEX idx_jobs_queue ON jobs(status, created_at);
-            CREATE INDEX idx_audits_time ON search_audits(started_at);
-
-            PRAGMA user_version=1;
-            """
-        )
-
-
-def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
-    with conn:
-        conn.execute("ALTER TABLE artifacts DROP COLUMN attempts")
-        conn.executescript(
-            """
-            CREATE TABLE job_logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              job_key TEXT NOT NULL REFERENCES jobs(key) ON DELETE CASCADE,
-              level TEXT NOT NULL CHECK(level IN ('info','warning','error')),
-              message TEXT NOT NULL,
-              data TEXT,
-              created_at TEXT NOT NULL
-            );
-
             CREATE INDEX idx_job_logs_job ON job_logs(job_key, id);
+            CREATE INDEX idx_audits_time ON search_audits(started_at);
 
             PRAGMA user_version=2;
             """
@@ -615,6 +589,24 @@ def get_index(settings: Settings, selected_index_key: str) -> dict[str, Any] | N
     with db_read_connection(settings) as conn:
         row = conn.execute("SELECT * FROM indexes WHERE key = ?", (selected_index_key,)).fetchone()
         return row_to_dict(row) if row else None
+
+
+def delete_index(settings: Settings, index_key: str) -> dict[str, Any]:
+    with db_write_connection(settings) as conn:
+        row = conn.execute("SELECT * FROM indexes WHERE key = ?", (index_key,)).fetchone()
+        if row is None:
+            raise ValueError("index not found")
+        index = row_to_dict(row)
+        if index["status"] in {"active", "building"}:
+            raise ValueError("cannot delete an active or building index")
+        with conn:
+            conn.execute("DELETE FROM index_rows WHERE index_key = ?", (index_key,))
+            conn.execute("DELETE FROM indexes WHERE key = ?", (index_key,))
+
+    cache_dir = settings.storage.index_cache_dir / index_key.replace(":", "_")
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    return index
 
 
 def list_problems(
@@ -687,7 +679,7 @@ def get_problem(settings: Settings, problem_key: str) -> dict[str, Any] | None:
             row_to_dict(rewrite)
             for rewrite in conn.execute(
                 """
-                SELECT key, method_key, status, error, updated_at
+                SELECT key, method_key, data, status, error, updated_at
                 FROM artifacts
                 WHERE kind = 'rewrite'
                   AND parent_key = ?
@@ -968,24 +960,6 @@ def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
     if updated is None:
         raise ValueError("job not found after cancel")
     return updated
-
-
-def create_cleanup_job(settings: Settings) -> dict[str, Any]:
-    job_key = "j:" + uuid.uuid4().hex
-    now = utc_now()
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
-                VALUES (?, 'cleanup', 'queued', ?, ?, ?, ?)
-                """,
-                (job_key, json_dumps({}), json_dumps({"phase": "queued"}), now, now),
-            )
-    job = get_job(settings, job_key)
-    if job is None:
-        raise ValueError("cleanup job was not created")
-    return job
 
 
 def mark_job_failed(settings: Settings, job_key: str, error: str) -> None:

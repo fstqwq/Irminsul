@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 from app import create_app
-from core import db_connection, ensure_database, get_settings, hash_password, text_key, utc_now
+from core import db_read_connection, db_write_connection, ensure_database, get_settings, hash_password, text_key, utc_now
 from search import IndexState, RewriteResult
 
 
@@ -173,7 +173,7 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         assert empty_audits.status_code == 200
         assert empty_audits.json()["items"] == []
 
-    with db_connection(test_settings) as conn:
+    with db_read_connection(test_settings) as conn:
         audit = conn.execute("SELECT * FROM search_audits").fetchone()
 
     assert audit["query"] == "hello"
@@ -493,7 +493,7 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         assert jobs.status_code == 200
         assert jobs.json()["items"][0]["key"] == payload["job_key"]
 
-        with db_connection(test_settings) as conn:
+        with db_write_connection(test_settings) as conn:
             with conn:
                 conn.execute(
                     """
@@ -510,7 +510,7 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         assert canceled.json()["status"] == "failed"
         assert canceled.json()["result"]["canceled"] is True
 
-        with db_connection(test_settings) as conn:
+        with db_write_connection(test_settings) as conn:
             with conn:
                 conn.execute(
                     """
@@ -540,7 +540,7 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         assert refreshed.status_code == 200
         assert refreshed.json()["progress"]["cancel_requested"] is True
 
-    with db_connection(test_settings) as conn:
+    with db_read_connection(test_settings) as conn:
         source = conn.execute("SELECT * FROM sources WHERE key = 'CodeForces'").fetchone()
         problem = conn.execute("SELECT * FROM problems WHERE key = 'CodeForces/1A'").fetchone()
         artifact = conn.execute(
@@ -580,7 +580,7 @@ def test_index_build_activate_and_health(monkeypatch, tmp_path: Path) -> None:
 
     problem_text = "Build through API."
     problem_text_key = text_key(problem_text)
-    with db_connection(test_settings) as conn:
+    with db_write_connection(test_settings) as conn:
         with conn:
             conn.execute(
                 "INSERT INTO sources(key, name, updated_at) VALUES ('CF', 'CF', ?)",
@@ -672,7 +672,7 @@ def test_startup_active_index_cache_failure_degrades(tmp_path: Path) -> None:
     ensure_database(test_settings)
 
     index_key = "i:missing-cache"
-    with db_connection(test_settings) as conn:
+    with db_write_connection(test_settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -693,7 +693,7 @@ def test_startup_active_index_cache_failure_degrades(tmp_path: Path) -> None:
     app_module._load_active_index(test_settings, state)
 
     assert state.current is None
-    with db_connection(test_settings) as conn:
+    with db_read_connection(test_settings) as conn:
         row = conn.execute("SELECT status, error FROM indexes WHERE key = ?", (index_key,)).fetchone()
 
     assert row["status"] == "active"

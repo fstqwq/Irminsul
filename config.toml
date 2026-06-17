@@ -33,7 +33,6 @@ rerank_range_floor = 0.1
 embedding_range_floor = 0.05
 
 [index_cache]
-keep_retired = 3
 load_mode = "mmap"
 activation_drain_timeout_seconds = 30
 

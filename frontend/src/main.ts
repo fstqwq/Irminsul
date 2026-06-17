@@ -3,8 +3,7 @@ import "@fontsource/ibm-plex-mono/latin-400.css";
 import "@fontsource/ibm-plex-mono/latin-500.css";
 import "temml/dist/Temml-Local.css";
 import { fetchConfig, fetchHealth, streamSearch, type StreamEvent } from "./api";
-import { startAdmin } from "./admin";
-import { renderApp, type Actions } from "./render";
+import { renderApp, type Actions } from "./search";
 import {
   createInitialState,
   initialStages,
@@ -21,9 +20,22 @@ if (!root) throw new Error("Missing #root");
 const appRoot = root;
 
 if (window.location.pathname.startsWith("/admin")) {
-  startAdmin(appRoot);
+  void startAdminApp(appRoot);
 } else {
   startSearchApp();
+}
+
+async function startAdminApp(root: HTMLElement): Promise<void> {
+  document.documentElement.dataset.theme = "light";
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = "/pico.classless.blue.min.css";
+  document.head.append(link);
+  const style = document.createElement("style");
+  style.textContent = ":root[data-theme=light]{--pico-font-family:var(--sans);--pico-font-size:100%;--pico-spacing:.75rem;--pico-block-spacing-vertical:.8rem;--pico-form-element-spacing-vertical:.38rem;--pico-form-element-spacing-horizontal:.6rem}.admin-app{width:min(1280px,calc(100vw - 48px));margin:auto;padding:18px 0}#root .admin-app>header,#root article>header{display:flex;align-items:center;justify-content:space-between;gap:1rem}#root h1{font-size:1.6rem;margin:0}#root h2{font-size:1.15rem}#root nav{align-items:center;gap:1rem}#root nav ul:last-child{justify-content:flex-end;flex-wrap:wrap}#root :is(input,select,textarea,button){font-size:.875rem}#root :is(button,[type=submit],[type=button],[type=reset]){width:auto;padding:.42rem .68rem;line-height:1.2}#root :is(#importForm,#problemFilterForm,#jobFilterForm,#auditFilterForm){display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:.6rem;align-items:end}#root #importForm{grid-template-columns:minmax(220px,1fr) 220px auto}#root article{overflow:auto}#root table{white-space:nowrap}#root .audit-query{display:block;max-width:72ch;white-space:normal;overflow-wrap:anywhere;line-height:1.45}#root td button{margin:.1rem .2rem .1rem 0}#root mark{background:#fee2e2;color:#b42318;padding:.08rem .25rem}#root mark.status{background:#eef2ff;color:#3730a3}#root mark.succeeded,#root mark.active,#root mark.built{background:#dcfce7;color:#166534}#root mark.failed,#root mark.blocked{background:#fee2e2;color:#b42318}#root mark.running,#root mark.building{background:#dbeafe;color:#1d4ed8}#root mark.queued,#root mark.draft,#root mark.retired{background:#f1f5f9;color:#475569}#root textarea{width:100%}@media(max-width:720px){.admin-app{width:calc(100vw - 24px);padding:12px 0}#root nav,#root .admin-app>header{display:block}#root :is(#importForm,#problemFilterForm,#jobFilterForm,#auditFilterForm){display:block}#root :is(button,[type=submit],[type=button],[type=reset]){width:100%}}";
+  document.head.append(style);
+  const { startAdmin } = await import("./admin");
+  startAdmin(root);
 }
 
 function startSearchApp(): void {

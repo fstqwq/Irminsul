@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
-import uuid
 import shutil
+import uuid
 import gc
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,7 +20,6 @@ from core import (
     append_job_log,
     cancel_requested as _cancel_requested,
     canonical_text,
-    db_connection,
     db_read_connection,
     db_write_connection,
     embedding_key,
@@ -41,7 +40,7 @@ from core import (
     update_job_progress as _update_job_progress,
     utc_now,
 )
-from search import REWRITE_PROMPT, VIEWS, RewriteResult, embed_texts, normalize_matrix, rewrite_query
+from search import REWRITE_PROMPT, VIEWS, RewriteResult, embed_texts, normalize_matrix, read_jsonl_list, rewrite_query
 
 
 ImportMode = Literal["upsert", "insert_only", "sync_source"]
@@ -117,8 +116,6 @@ def run_next_job(settings: Settings) -> bool:
             execute_import_job(job["key"], settings)
         elif job["type"] == "build_index":
             execute_build_index_job(job["key"], settings)
-        elif job["type"] == "cleanup":
-            execute_cleanup_job(job["key"], settings)
         else:
             _mark_job_failed(settings, job["key"], f"unsupported job type: {job['type']}")
     except Exception as exc:
@@ -358,7 +355,10 @@ def delete_import_draft(job_key: str, settings: Settings) -> dict[str, Any]:
             payload = json.loads(job["payload"] or "{}")
             raw_path = payload.get("path")
             if raw_path:
-                upload_path = _ensure_inside(settings.storage.upload_dir, Path(str(raw_path)))
+                candidate = Path(str(raw_path)).resolve()
+                upload_root = settings.storage.upload_dir.resolve()
+                if upload_root in candidate.parents:
+                    upload_path = candidate
         except Exception:
             upload_path = None
 
@@ -367,7 +367,7 @@ def delete_import_draft(job_key: str, settings: Settings) -> dict[str, Any]:
 
     if upload_path is not None:
         try:
-            _remove_file_inside(settings.storage.upload_dir, upload_path)
+            upload_path.unlink(missing_ok=True)
         except OSError:
             pass
     return job
@@ -416,7 +416,7 @@ def confirm_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
 
 
 def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute(
             "SELECT * FROM jobs WHERE key = ? AND type = 'import'",
             (job_key,),
@@ -452,13 +452,13 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
     stats = {"total": len(rows), "new": 0, "overwrite": 0, "skip": 0, "disabled": 0}
     row_keys_by_source: dict[str, set[str]] = {}
 
-    with db_connection(settings) as conn:
-        for index, row in enumerate(rows, start=1):
-            if canceled := _finish_if_cancel_requested(settings, job_key, {"processed": index - 1, "total": len(rows)}):
-                return canceled
-            row_keys_by_source.setdefault(row.source_key, set()).add(row.problem_key)
-            now = utc_now()
-            problem_text_key = text_key(row.text)
+    for index, row in enumerate(rows, start=1):
+        if canceled := _finish_if_cancel_requested(settings, job_key, {"processed": index - 1, "total": len(rows)}):
+            return canceled
+        row_keys_by_source.setdefault(row.source_key, set()).add(row.problem_key)
+        now = utc_now()
+        problem_text_key = text_key(row.text)
+        with db_write_connection(settings) as conn:
             existing = conn.execute(
                 "SELECT key FROM problems WHERE key = ?",
                 (row.problem_key,),
@@ -524,17 +524,18 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                             ),
                         )
 
-            if index % 100 == 0 or index == len(rows):
-                _update_job_progress(
-                    settings,
-                    job_key,
-                    {"phase": "importing", "processed": index, "total": len(rows)},
-                )
+        if index % 100 == 0 or index == len(rows):
+            _update_job_progress(
+                settings,
+                job_key,
+                {"phase": "importing", "processed": index, "total": len(rows)},
+            )
 
-        if mode == "sync_source":
-            for source_key, imported_keys in row_keys_by_source.items():
-                placeholders = ",".join("?" for _ in imported_keys)
-                params = [source_key, *sorted(imported_keys)]
+    if mode == "sync_source":
+        for source_key, imported_keys in row_keys_by_source.items():
+            placeholders = ",".join("?" for _ in imported_keys)
+            params = [source_key, *sorted(imported_keys)]
+            with db_write_connection(settings) as conn:
                 with conn:
                     cursor = conn.execute(
                         f"""
@@ -549,6 +550,7 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
                     )
                     stats["disabled"] += cursor.rowcount
 
+    path.unlink(missing_ok=True)
     return _finish_job(settings, job_key, "succeeded", stats, None)
 
 
@@ -877,6 +879,8 @@ def create_build_index_job(settings: Settings) -> dict[str, Any]:
         "snapshot_path": str(snapshot_path),
         "rewrite_method_key": selected_rewrite_method_key,
         "embedding_method_key": selected_embedding_method_key,
+        "rewrite_method": _model_snapshot(settings, "rewrite"),
+        "embedding_method": _model_snapshot(settings, "embedding"),
         "problem_count": len(snapshot),
     }
     with db_write_connection(settings) as conn:
@@ -1101,7 +1105,7 @@ def _problem_progress(
 
 
 def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         row = conn.execute(
             "SELECT * FROM jobs WHERE key = ? AND type = 'build_index'",
             (job_key,),
@@ -1126,10 +1130,12 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                 (json_dumps({"phase": "rewrite"}), utc_now(), job_key),
             )
 
-    snapshot = _read_snapshot(Path(payload["snapshot_path"]))
+    snapshot = read_jsonl_list(Path(payload["snapshot_path"]))
     append_job_log(settings, job_key, "info", "Build index started", {"total": len(snapshot)})
     selected_rewrite_method_key = str(payload["rewrite_method_key"])
     selected_embedding_method_key = str(payload["embedding_method_key"])
+    selected_rewrite_method = payload["rewrite_method"]
+    selected_embedding_method = payload["embedding_method"]
     prepared: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     failed_problem_keys: set[str] = set()
@@ -1412,6 +1418,8 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
                             "schema_version": SCHEMA_VERSION,
                             "rewrite_method_key": selected_rewrite_method_key,
                             "embedding_method_key": selected_embedding_method_key,
+                            "rewrite_method": selected_rewrite_method,
+                            "embedding_method": selected_embedding_method,
                             "problem_count": len(prepared),
                             "cache_path": str(cache_path),
                         }
@@ -1643,15 +1651,6 @@ def _read_enabled_problem_snapshot(settings: Settings) -> list[dict[str, Any]]:
     return [row_to_dict(row) for row in rows]
 
 
-def _read_snapshot(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-    return rows
-
-
 def _build_index_rows(prepared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     row_hashes: list[str] = []
@@ -1764,176 +1763,3 @@ def _artifact_vector(artifact: dict[str, Any]) -> np.ndarray:
 
 def _safe_path_key(key: str) -> str:
     return key.replace(":", "_")
-
-
-def _ensure_inside(root: Path, target: Path) -> Path:
-    root_path = root.resolve()
-    target_path = target.resolve()
-    if target_path == root_path or root_path not in target_path.parents:
-        raise ValueError(f"refusing to delete outside configured directory: {target}")
-    return target_path
-
-
-def _remove_file_inside(root: Path, target: Path) -> int:
-    _ensure_inside(root, target)
-    if target.is_file():
-        target.unlink()
-        return 1
-    return 0
-
-
-def _remove_dir_inside(root: Path, target: Path) -> int:
-    _ensure_inside(root, target)
-    if target.is_dir():
-        shutil.rmtree(target)
-        return 1
-    return 0
-
-
-def _active_import_uploads(settings: Settings) -> set[Path]:
-    upload_root = settings.storage.upload_dir
-    protected: set[Path] = set()
-    with db_read_connection(settings) as conn:
-        rows = conn.execute(
-            """
-            SELECT payload
-            FROM jobs
-            WHERE type = 'import' AND status IN ('draft', 'queued', 'running')
-            """
-        ).fetchall()
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"])
-            path = Path(str(payload.get("path", "")))
-            protected.add(_ensure_inside(upload_root, path))
-        except Exception:
-            continue
-    return protected
-
-
-def _cleanup_expired_uploads(settings: Settings) -> int:
-    upload_root = settings.storage.upload_dir
-    if not upload_root.exists():
-        return 0
-    protected = _active_import_uploads(settings)
-    cutoff = datetime.now(UTC) - timedelta(days=settings.audit.retention_days)
-    removed = 0
-    for path in upload_root.iterdir():
-        if not path.is_file():
-            continue
-        resolved = path.resolve()
-        if resolved in protected:
-            continue
-        modified_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-        if modified_at < cutoff:
-            removed += _remove_file_inside(upload_root, path)
-    return removed
-
-
-def _kept_index_cache_names(settings: Settings) -> set[str]:
-    keep_keys: set[str] = set()
-    with db_read_connection(settings) as conn:
-        active = conn.execute(
-            "SELECT value FROM kv WHERE key = 'active_index_key'"
-        ).fetchone()
-        if active is not None:
-            keep_keys.add(str(active["value"]))
-        keep_keys.update(
-            str(row["key"])
-            for row in conn.execute(
-                "SELECT key FROM indexes WHERE status = 'active'"
-            ).fetchall()
-        )
-        if settings.index_cache.keep_retired > 0:
-            keep_keys.update(
-                str(row["key"])
-                for row in conn.execute(
-                    """
-                    SELECT key
-                    FROM indexes
-                    WHERE status IN ('built', 'retired')
-                    ORDER BY COALESCE(activated_at, created_at) DESC
-                    LIMIT ?
-                    """,
-                    (settings.index_cache.keep_retired,),
-                ).fetchall()
-            )
-    return {_safe_path_key(key) for key in keep_keys}
-
-
-def _cleanup_old_index_caches(settings: Settings) -> int:
-    cache_root = settings.storage.index_cache_dir
-    if not cache_root.exists():
-        return 0
-    keep_names = _kept_index_cache_names(settings)
-    removed = 0
-    for path in cache_root.iterdir():
-        if path.name == ".building" or not path.is_dir():
-            continue
-        if path.name not in keep_names:
-            removed += _remove_dir_inside(cache_root, path)
-    return removed
-
-
-def execute_cleanup_job(job_key: str, settings: Settings) -> dict[str, Any]:
-    cutoff = utc_now()
-    removed_audits = 0
-    with db_connection(settings) as conn:
-        row = conn.execute(
-            "SELECT * FROM jobs WHERE key = ? AND type = 'cleanup'",
-            (job_key,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("cleanup job not found")
-        if row["status"] != "queued":
-            raise ValueError("cleanup job is not queued")
-        job = row_to_dict(row)
-        if _job_progress(job).get("cancel_requested"):
-            return _finish_job(settings, job_key, "failed", {"canceled": True}, "Canceled by admin")
-
-    with db_write_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ?",
-                (json_dumps({"phase": "audits"}), utc_now(), job_key),
-            )
-            cursor = conn.execute(
-                """
-                DELETE FROM search_audits
-                WHERE started_at < datetime('now', ?)
-                """,
-                (f"-{settings.audit.retention_days} days",),
-            )
-            removed_audits = cursor.rowcount
-
-    if canceled := _finish_if_cancel_requested(settings, job_key, {"removed_audits": removed_audits}):
-        return canceled
-
-    _update_job_progress(settings, job_key, {"phase": "uploads"})
-    removed_uploads = _cleanup_expired_uploads(settings)
-
-    if canceled := _finish_if_cancel_requested(
-        settings,
-        job_key,
-        {"removed_audits": removed_audits, "removed_uploads": removed_uploads},
-    ):
-        return canceled
-
-    _update_job_progress(settings, job_key, {"phase": "cache"})
-    building_dir = settings.storage.index_cache_dir / ".building"
-    removed_building_dirs = _remove_dir_inside(settings.storage.index_cache_dir, building_dir)
-    removed_index_caches = _cleanup_old_index_caches(settings)
-
-    return _finish_job(
-        settings,
-        job_key,
-        "succeeded",
-        {
-            "removed_audits": removed_audits,
-            "removed_uploads": removed_uploads,
-            "removed_building_dirs": removed_building_dirs,
-            "removed_index_caches": removed_index_caches,
-            "cutoff": cutoff,
-        },
-        None,
-    )

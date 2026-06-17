@@ -8,7 +8,6 @@ from search import (
     REWRITE_VIEW_MAX_CHARS,
     RewriteFormatError,
     VIEWS,
-    extract_title,
     fuse_scores,
     parse_rewrite_output,
     rewrite_query_with_usage,
@@ -36,16 +35,6 @@ def test_settings_load() -> None:
         ]
         == 50000
     )
-
-
-def test_title_fallbacks() -> None:
-    assert extract_title({"title": "  Two Sum  "}, "fallback") == "Two Sum"
-    assert (
-        extract_title({"text": "**title** : Legs on a Farm\nbody"}, "fallback")
-        == "Legs on a Farm"
-    )
-    assert extract_title({"text": "## Problem Name\nP9064\nbody"}, "fallback") == "P9064"
-    assert extract_title({"text": ""}, "fallback") == "fallback"
 
 
 def test_parse_rewrite_output_rejects_oversized_view() -> None:

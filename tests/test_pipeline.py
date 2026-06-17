@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import json
-import os
 import gc
 import shutil
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
-from core import create_cleanup_job, db_connection, ensure_database, get_settings, text_key, utc_now
+from core import db_read_connection, db_write_connection, ensure_database, get_settings, text_key, utc_now
 from pipeline import (
     create_build_index_job,
     embedding_method_key,
     ensure_embedding_artifacts,
     ensure_rewrite_artifact,
     execute_build_index_job,
-    execute_cleanup_job,
     index_cache_path,
     rebuild_index_cache,
     rewrite_method_key,
@@ -87,7 +84,7 @@ def test_rewrite_and_embedding_artifacts_are_reused(monkeypatch, tmp_path: Path)
     problem_text = "Original statement with details."
     problem_text_key = text_key(problem_text)
 
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 """
@@ -159,7 +156,7 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
     problem_text = "Build this problem."
     problem_text_key = text_key(problem_text)
 
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 "INSERT INTO sources(key, name, updated_at) VALUES ('CF', 'CF', ?)",
@@ -223,7 +220,7 @@ def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
     del loaded
     gc.collect()
 
-    with db_connection(settings) as conn:
+    with db_read_connection(settings) as conn:
         index = conn.execute("SELECT * FROM indexes WHERE key = ?", (index_key,)).fetchone()
         row_count = conn.execute(
             "SELECT count(*) FROM index_rows WHERE index_key = ?",
@@ -248,7 +245,7 @@ def test_build_index_rewrites_all_problems_before_embedding(monkeypatch, tmp_pat
         ("CF/2A", "Second problem text."),
     ]
 
-    with db_connection(settings) as conn:
+    with db_write_connection(settings) as conn:
         with conn:
             conn.execute(
                 "INSERT INTO sources(key, name, updated_at) VALUES ('CF', 'CF', ?)",
@@ -306,82 +303,3 @@ def test_build_index_rewrites_all_problems_before_embedding(monkeypatch, tmp_pat
     assert finished["status"] == "succeeded"
     assert rewrite_calls == len(problems)
     assert embed_batches == [len(problems) * 4]
-
-
-def test_cleanup_removes_expired_operational_files(tmp_path: Path) -> None:
-    base_settings = _temp_settings(tmp_path)
-    settings = replace(
-        base_settings,
-        audit=replace(base_settings.audit, retention_days=1),
-        index_cache=replace(base_settings.index_cache, keep_retired=1),
-    )
-    ensure_database(settings)
-    settings.storage.upload_dir.mkdir(parents=True, exist_ok=True)
-    settings.storage.index_cache_dir.mkdir(parents=True, exist_ok=True)
-
-    old_upload = settings.storage.upload_dir / "old.jsonl"
-    protected_upload = settings.storage.upload_dir / "protected.jsonl"
-    old_upload.write_text("{}", encoding="utf-8")
-    protected_upload.write_text("{}", encoding="utf-8")
-    old_timestamp = (datetime.now(UTC) - timedelta(days=2)).timestamp()
-    os.utime(old_upload, (old_timestamp, old_timestamp))
-    os.utime(protected_upload, (old_timestamp, old_timestamp))
-
-    active_cache = index_cache_path(settings, "i:active")
-    recent_cache = index_cache_path(settings, "i:recent")
-    stale_cache = index_cache_path(settings, "i:stale")
-    building_cache = settings.storage.index_cache_dir / ".building" / "leftover"
-    for path in (active_cache, recent_cache, stale_cache, building_cache):
-        path.mkdir(parents=True, exist_ok=True)
-        (path / "marker").write_text("x", encoding="utf-8")
-
-    now = utc_now()
-    with db_connection(settings) as conn:
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO search_audits(
-                  request_id, started_at, finished_at, status, client_ip, user_agent,
-                  query, timings, api_calls, result, cost, error
-                )
-                VALUES ('old-audit', '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z',
-                        'succeeded', '', '', 'q', '{}', '[]', '{}', '{"microusd":0}', NULL)
-                """
-            )
-            conn.execute(
-                "INSERT INTO kv(key, value, updated_at) VALUES ('active_index_key', 'i:active', ?)",
-                (now,),
-            )
-            conn.executemany(
-                """
-                INSERT INTO indexes(key, status, meta, created_at, activated_at)
-                VALUES (?, ?, '{}', ?, ?)
-                """,
-                [
-                    ("i:active", "active", "2026-01-03T00:00:00Z", "2026-01-03T00:00:00Z"),
-                    ("i:recent", "built", "2026-01-02T00:00:00Z", None),
-                    ("i:stale", "retired", "2026-01-01T00:00:00Z", None),
-                ],
-            )
-            conn.execute(
-                """
-                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
-                VALUES ('j:protected', 'import', 'draft', ?, '{}', ?, ?)
-                """,
-                (json.dumps({"path": str(protected_upload)}), now, now),
-            )
-
-    job = create_cleanup_job(settings)
-    finished = execute_cleanup_job(job["key"], settings)
-    result = json.loads(finished["result"])
-
-    assert result["removed_audits"] == 1
-    assert result["removed_uploads"] == 1
-    assert result["removed_building_dirs"] == 1
-    assert result["removed_index_caches"] == 1
-    assert not old_upload.exists()
-    assert protected_upload.exists()
-    assert active_cache.exists()
-    assert recent_cache.exists()
-    assert not stale_cache.exists()
-    assert not (settings.storage.index_cache_dir / ".building").exists()

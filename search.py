@@ -220,38 +220,6 @@ def normalize_matrix(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def _compact_title(title: str, fallback: str) -> str:
-    title = " ".join(title.split()).strip()
-    if not title:
-        return fallback
-    return title[:117] + "..." if len(title) > 120 else title
-
-
-def extract_title(row: dict[str, Any] | None, fallback: str) -> str:
-    if not row:
-        return fallback
-    explicit = row.get("title")
-    if isinstance(explicit, str) and explicit.strip():
-        return _compact_title(explicit, fallback)
-
-    text = str(row.get("text") or "")
-    patterns = (
-        r"(?im)^\s*\*\*title\*\*\s*:\s*(.+?)\s*$",
-        r"(?im)^\s*##\s*Problem Name\s*$\s*^(.+?)\s*$",
-        r"(?im)^\s*#\s+(.+?)\s*$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return _compact_title(match.group(1), fallback)
-
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            return _compact_title(line, fallback)
-    return fallback
-
-
 def _find_section_marker(text: str, name: str) -> re.Match[str] | None:
     pattern = rf"(?im)^[ \t]*(?:\*\*)?\[?{name}\]?(?:\*\*)?[ \t]*:?[ \t]*$"
     return re.search(pattern, text)
@@ -514,11 +482,6 @@ def _numeric(value: Any) -> float:
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return 0.0
     return 0.0
 
 

@@ -23,9 +23,9 @@ from core import (
     Settings,
     batch_update_problems,
     cancel_job,
-    create_cleanup_job,
     db_read_connection,
     db_write_connection,
+    delete_index,
     ensure_database,
     get_index,
     get_job,
@@ -294,38 +294,6 @@ def _decode_job_log(row: dict[str, Any]) -> dict[str, Any]:
         except ValueError:
             decoded["data"] = value
     return decoded
-
-
-def _fallback_job_logs(job: dict[str, Any]) -> list[dict[str, Any]]:
-    result = job.get("result")
-    if not isinstance(result, dict):
-        return []
-    logs: list[dict[str, Any]] = []
-    if result.get("canceled"):
-        logs.append(
-            {
-                "id": 0,
-                "job_key": job.get("key"),
-                "level": "warning",
-                "message": "Job canceled",
-                "data": None,
-                "created_at": job.get("updated_at"),
-            }
-        )
-    failures = result.get("failures")
-    if isinstance(failures, list):
-        for index, failure in enumerate(failures[:500], start=1):
-            logs.append(
-                {
-                    "id": index,
-                    "job_key": job.get("key"),
-                    "level": "error",
-                    "message": "Artifact generation failed",
-                    "data": failure,
-                    "created_at": job.get("updated_at"),
-                }
-            )
-    return logs
 
 
 def _decode_index(index: dict[str, Any]) -> dict[str, Any]:
@@ -698,7 +666,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Job not found")
         decoded = _decode_job(job)
         logs = [_decode_job_log(row) for row in list_job_logs(settings(), job_key)]
-        decoded["logs"] = logs or _fallback_job_logs(decoded)
+        decoded["logs"] = logs
         return decoded
 
     @app.post("/admin/api/jobs/{job_key}/retry")
@@ -731,14 +699,6 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/admin/api/jobs/cleanup")
-    def cleanup_job(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-        del session
-        try:
-            return _decode_job(create_cleanup_job(settings()))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     @app.get("/admin/api/indexes")
     def indexes(session: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         del session
@@ -754,6 +714,17 @@ def create_app() -> FastAPI:
         if index is None:
             raise HTTPException(status_code=404, detail="Index not found")
         return _decode_index(index)
+
+    @app.delete("/admin/api/indexes/{index_key}")
+    def index_delete(
+        index_key: str,
+        session: dict[str, Any] = Depends(require_admin),
+    ) -> dict[str, Any]:
+        del session
+        try:
+            return _decode_index(delete_index(settings(), index_key))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/admin/api/index/{index_key}/activate")
     def index_activate(

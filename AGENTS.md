@@ -25,7 +25,7 @@ Repository root: C:\code\yuantiji\src
 Deployment model: single machine, single process, single Uvicorn worker, single background job worker.
 SQLite connections: always PRAGMA foreign_keys=ON; journal_mode=WAL; busy_timeout=5000;
 Schema migration: PRAGMA user_version, not Alembic.
-Frontend stack: vanilla TypeScript + Vite, no component frameworks.
+Frontend stack: vanilla TypeScript + Vite; admin uses PicoCSS classless styles; no component frameworks.
 Admin UI style: dense and operational (tables, filters, status, logs), not marketing-style.
 Language: use English for all code, comments, UI text, and API responses. Do not mix Chinese and English.
 ```
