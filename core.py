@@ -899,44 +899,48 @@ def retry_job(settings: Settings, job_key: str) -> dict[str, Any]:
 
 
 def cancel_job(settings: Settings, job_key: str) -> dict[str, Any]:
-    job = get_job(settings, job_key)
-    if job is None:
-        raise ValueError("job not found")
-    if job["status"] in {"succeeded", "blocked", "failed"}:
-        raise ValueError("job is not running or queued")
-
-    progress = job_progress(job)
-    progress["cancel_requested"] = True
-    progress.setdefault("phase", "canceling")
-    result = job_result(job)
-    result["canceled"] = True
     now = utc_now()
     with db_write_connection(settings) as conn:
-        with conn:
-            if job["status"] in {"draft", "queued"}:
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = 'failed', progress = ?, result = ?, error = ?, updated_at = ?
-                    WHERE key = ?
-                    """,
-                    (
-                        json_dumps(progress),
-                        json_dumps(result),
-                        "Canceled by admin",
-                        now,
-                        job_key,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET progress = ?, result = ?, updated_at = ?
-                    WHERE key = ? AND status = 'running'
-                    """,
-                    (json_dumps(progress), json_dumps(result), now, job_key),
-                )
+        while True:
+            row = conn.execute("SELECT * FROM jobs WHERE key = ?", (job_key,)).fetchone()
+            if row is None:
+                raise ValueError("job not found")
+            job = row_to_dict(row)
+            if job["status"] in {"succeeded", "blocked", "failed"}:
+                raise ValueError("job is not running or queued")
+
+            progress = job_progress(job)
+            progress["cancel_requested"] = True
+            progress.setdefault("phase", "canceling")
+            result = job_result(job)
+            result["canceled"] = True
+            with conn:
+                if job["status"] in {"draft", "queued"}:
+                    cursor = conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'failed', progress = ?, result = ?, error = ?, updated_at = ?
+                        WHERE key = ? AND status IN ('draft', 'queued')
+                        """,
+                        (
+                            json_dumps(progress),
+                            json_dumps(result),
+                            "Canceled by admin",
+                            now,
+                            job_key,
+                        ),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE jobs
+                        SET progress = ?, result = ?, updated_at = ?
+                        WHERE key = ? AND status = 'running'
+                        """,
+                        (json_dumps(progress), json_dumps(result), now, job_key),
+                    )
+            if cursor.rowcount:
+                break
     append_job_log(settings, job_key, "warning", "Cancellation requested")
     updated = get_job(settings, job_key)
     if updated is None:

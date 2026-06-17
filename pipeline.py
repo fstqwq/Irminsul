@@ -174,26 +174,52 @@ def recover_startup(settings: Settings) -> None:
         shutil.rmtree(building_dir)
 
 
+def _claim_next_job(settings: Settings) -> dict[str, Any] | None:
+    with db_write_connection(settings) as conn:
+        while True:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = 'queued'
+                ORDER BY created_at
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+
+            job = row_to_dict(row)
+            now = utc_now()
+            if job["type"] == "import":
+                sql = "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ? AND status = 'queued'"
+                params = (json_dumps({"phase": "reading"}), now, job["key"])
+            elif job["type"] == "build_index":
+                sql = (
+                    "UPDATE jobs SET status = 'running', progress = ?, result = NULL, "
+                    "error = NULL, updated_at = ? WHERE key = ? AND status = 'queued'"
+                )
+                params = (json_dumps({"phase": "rewrite"}), now, job["key"])
+            else:
+                sql = "UPDATE jobs SET status = 'running', updated_at = ? WHERE key = ? AND status = 'queued'"
+                params = (now, job["key"])
+
+            with conn:
+                cursor = conn.execute(sql, params)
+            if cursor.rowcount:
+                return job
+
+
 def run_next_job(settings: Settings) -> bool:
-    with db_read_connection(settings) as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM jobs
-            WHERE status = 'queued'
-            ORDER BY created_at
-            LIMIT 1
-            """
-        ).fetchone()
-    if row is None:
+    job = _claim_next_job(settings)
+    if job is None:
         return False
 
-    job = row_to_dict(row)
     job_ctx = PipelineJob(settings, job["key"])
     try:
         if job["type"] == "import":
-            execute_import_job(job["key"], settings)
+            execute_import_job(job["key"], settings, claimed=True)
         elif job["type"] == "build_index":
-            execute_build_index_job(job["key"], settings)
+            execute_build_index_job(job["key"], settings, claimed=True)
         else:
             mark_job_failed(settings, job["key"], f"unsupported job type: {job['type']}")
     except Exception as exc:
@@ -493,7 +519,7 @@ def confirm_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
     return job
 
 
-def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
+def execute_import_job(job_key: str, settings: Settings, *, claimed: bool = False) -> dict[str, Any]:
     job_ctx = PipelineJob(settings, job_key)
     with db_read_connection(settings) as conn:
         row = conn.execute(
@@ -503,19 +529,23 @@ def execute_import_job(job_key: str, settings: Settings) -> dict[str, Any]:
         if row is None:
             raise ValueError("import job not found")
         job = row_to_dict(row)
-        if job["status"] != "queued":
-            raise ValueError("import job is not queued")
+        expected_status = "running" if claimed else "queued"
+        if job["status"] != expected_status:
+            raise ValueError(f"import job is not {expected_status}")
         if job_progress(job).get("cancel_requested"):
             return job_ctx.finish("failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
         path = Path(payload["path"])
         mode = _validate_import_mode(str(payload["mode"]))
 
-    db_exec(
-        settings,
-        "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ?",
-        (json_dumps({"phase": "reading"}), utc_now(), job_key),
-    )
+    if not claimed:
+        rowcount = db_exec(
+            settings,
+            "UPDATE jobs SET status = 'running', progress = ?, updated_at = ? WHERE key = ? AND status = 'queued'",
+            (json_dumps({"phase": "reading"}), utc_now(), job_key),
+        )
+        if rowcount == 0:
+            raise ValueError("import job is not queued")
 
     rows, errors = read_import_jsonl(path, settings)
     if errors:
@@ -1087,7 +1117,7 @@ def _ensure_rewrites_for_snapshot(
     return rewrite_by_text_key
 
 
-def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
+def execute_build_index_job(job_key: str, settings: Settings, *, claimed: bool = False) -> dict[str, Any]:
     job_ctx = PipelineJob(settings, job_key)
     with db_read_connection(settings) as conn:
         row = conn.execute(
@@ -1097,18 +1127,22 @@ def execute_build_index_job(job_key: str, settings: Settings) -> dict[str, Any]:
         if row is None:
             raise ValueError("build job not found")
         job = row_to_dict(row)
-        if job["status"] != "queued":
-            raise ValueError("build job is not queued")
+        expected_status = "running" if claimed else "queued"
+        if job["status"] != expected_status:
+            raise ValueError(f"build job is not {expected_status}")
         if job_progress(job).get("cancel_requested"):
             return job_ctx.finish("failed", {"canceled": True}, "Canceled by admin")
         payload = json.loads(job["payload"])
 
-    db_exec(
-        settings,
-        "UPDATE jobs SET status = 'running', progress = ?, result = NULL, error = NULL, updated_at = ? "
-        "WHERE key = ?",
-        (json_dumps({"phase": "rewrite"}), utc_now(), job_key),
-    )
+    if not claimed:
+        rowcount = db_exec(
+            settings,
+            "UPDATE jobs SET status = 'running', progress = ?, result = NULL, error = NULL, updated_at = ? "
+            "WHERE key = ? AND status = 'queued'",
+            (json_dumps({"phase": "rewrite"}), utc_now(), job_key),
+        )
+        if rowcount == 0:
+            raise ValueError("build job is not queued")
 
     snapshot = read_jsonl_list(Path(payload["snapshot_path"]))
     job_ctx.info("Build index started", {"total": len(snapshot)})

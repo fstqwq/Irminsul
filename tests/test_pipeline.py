@@ -19,6 +19,7 @@ from pipeline import (
     index_cache_path,
     rebuild_index_cache,
     rewrite_method_key,
+    run_next_job,
 )
 from search import IndexState, RewriteResult, load_index_cache
 
@@ -148,6 +149,77 @@ def test_rewrite_and_embedding_artifacts_are_reused(monkeypatch, tmp_path: Path)
         assert artifact["status"] == "succeeded"
         assert data["dim"] == 3
         assert len(artifact["blob"]) == 12
+
+
+def test_run_next_job_claims_job_before_execution(monkeypatch, tmp_path: Path) -> None:
+    settings = _temp_settings(tmp_path)
+    ensure_database(settings)
+    now = utc_now()
+    with db_write_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                VALUES ('j:claim', 'import', 'queued', '{}', '{"phase":"queued"}', ?, ?)
+                """,
+                (now, now),
+            )
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_execute_import_job(job_key, current_settings, *, claimed=False):
+        calls.append((job_key, claimed))
+        with db_read_connection(current_settings) as conn:
+            row = conn.execute("SELECT status, progress FROM jobs WHERE key = ?", (job_key,)).fetchone()
+        assert row["status"] == "running"
+        assert json.loads(row["progress"])["phase"] == "reading"
+        return {}
+
+    monkeypatch.setattr("pipeline.execute_import_job", fake_execute_import_job)
+
+    assert run_next_job(settings) is True
+    assert run_next_job(settings) is False
+    assert calls == [("j:claim", True)]
+
+
+def test_run_next_job_does_not_double_claim(monkeypatch, tmp_path: Path) -> None:
+    settings = _temp_settings(tmp_path)
+    ensure_database(settings)
+    now = utc_now()
+    with db_write_connection(settings) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO jobs(key, type, status, payload, progress, created_at, updated_at)
+                VALUES ('j:single', 'import', 'queued', '{}', '{"phase":"queued"}', ?, ?)
+                """,
+                (now, now),
+            )
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[tuple[str, bool]] = []
+    results: list[bool] = []
+
+    def fake_execute_import_job(job_key, current_settings, *, claimed=False):
+        del current_settings
+        calls.append((job_key, claimed))
+        entered.set()
+        assert release.wait(2)
+        return {}
+
+    monkeypatch.setattr("pipeline.execute_import_job", fake_execute_import_job)
+
+    threads = [threading.Thread(target=lambda: results.append(run_next_job(settings))) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(2)
+    release.set()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(results) == [False, True]
+    assert calls == [("j:single", True)]
 
 
 def test_build_index_exports_cache(monkeypatch, tmp_path: Path) -> None:
