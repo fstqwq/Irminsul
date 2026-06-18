@@ -31,6 +31,7 @@ from core import (
     get_job,
     get_problem,
     get_settings,
+    json_dumps,
     list_import_jobs,
     list_indexes,
     list_job_logs,
@@ -533,6 +534,39 @@ def create_app() -> FastAPI:
     @admin_router.get("/sources")
     def sources() -> dict[str, Any]:
         return {"items": list_sources(settings())}
+
+    @admin_router.get("/export")
+    def export_problems(source_key: str | None = None) -> StreamingResponse:
+        current_settings = settings()
+        sql = """
+            SELECT p.key AS id, p.title, a.text, p.url
+            FROM problems p
+            JOIN artifacts a ON a.key = p.text_key
+            WHERE p.deleted = 0
+        """
+        params: list[Any] = []
+        if source_key:
+            sql += " AND p.source_key = ?"
+            params.append(source_key)
+        sql += " ORDER BY p.key"
+        with db_read_connection(current_settings) as conn:
+            rows = [row_to_dict(row) for row in conn.execute(sql, params).fetchall()]
+
+        def generate() -> Any:
+            for row in rows:
+                yield json_dumps(row) + "\n"
+
+        filename_key = (
+            "".join(char if char.isalnum() or char in "._-" else "-" for char in source_key)
+            if source_key
+            else "all"
+        )
+        filename = f"export-{filename_key}.jsonl"
+        return StreamingResponse(
+            generate(),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @admin_router.patch("/sources/{source_key}")
     def source_patch(

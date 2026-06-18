@@ -389,6 +389,8 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
     )
 
     with TestClient(create_app()) as client:
+        assert client.get("/admin/api/export").status_code == 401
+
         login = client.post("/admin/api/auth/login", json={"password": "secret"})
         csrf = client.cookies.get("admin_csrf")
         assert login.status_code == 200
@@ -488,6 +490,25 @@ def test_import_dry_run_and_confirm(monkeypatch, tmp_path: Path) -> None:
         sources = client.get("/admin/api/sources")
         assert sources.status_code == 200
         assert sources.json()["items"][0]["problem_count"] == 1
+
+        export_all = client.get("/admin/api/export")
+        assert export_all.status_code == 200
+        assert export_all.headers["content-disposition"] == 'attachment; filename="export-all.jsonl"'
+        assert export_all.headers["content-type"].startswith("application/x-ndjson")
+        exported = [json.loads(line) for line in export_all.text.splitlines()]
+        assert exported == [
+            {
+                "id": "CodeForces/1A",
+                "title": "Updated Theatre Square",
+                "text": updated_text,
+                "url": "https://codeforces.com/problemset/problem/1/A",
+            }
+        ]
+
+        export_source = client.get("/admin/api/export?source_key=CodeForces")
+        assert export_source.status_code == 200
+        assert export_source.headers["content-disposition"] == 'attachment; filename="export-CodeForces.jsonl"'
+        assert [json.loads(line) for line in export_source.text.splitlines()] == exported
 
         patched_source = client.patch(
             "/admin/api/sources/CodeForces",

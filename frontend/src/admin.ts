@@ -197,11 +197,16 @@ function problemEditor(problem: Row): string {
   return detailPanel("Problem detail", "problem", detailFields([["ID", problem.key, "key"], ["Source", problem.source_key], ["Enabled", truthy(problem.enabled) ? "Yes" : "No"], ["Deleted", truthy(problem.deleted) ? "Yes" : "No"], ["Updated", problem.updated_at, "date"], ["URL", problem.url]]) + artifactStatusBlock(problem) + form);
 }
 
+function exportFilename(sourceKey?: string): string {
+  const suffix = sourceKey ? sourceKey.replace(/[^A-Za-z0-9._-]/g, "-") : "all";
+  return `export-${suffix}.jsonl`;
+}
+
 function renderSources(data: Row): string {
-  return table([
+  return `${article("", `<a href="/admin/api/export" role="button" download="${exportFilename()}">Export all</a>`)}${table([
     ["ID", (row) => h(row.key)], ["Name", (row) => h(row.name)], ["Enabled", (row) => flag(row.enabled)], ["Problems", (row) => v(row.problem_count)], ["Enabled problems", (row) => v(row.enabled_problem_count)], ["Deleted", (row) => v(row.deleted_count)],
-    ["", (row) => { const key = String(row.key || ""); const enabled = truthy(row.enabled); return `<button data-source-toggle="${h(key)}" data-enabled="${enabled}" type="button">${enabled ? "Disable" : "Enable"}</button> <button data-source-problems="${h(key)}" type="button">Problems</button>`; }]
-  ], asRows(data.items));
+    ["", (row) => { const key = String(row.key || ""); const enabled = truthy(row.enabled); return `<button data-source-toggle="${h(key)}" data-enabled="${enabled}" type="button">${enabled ? "Disable" : "Enable"}</button> <button data-source-problems="${h(key)}" type="button">Problems</button> <a href="/admin/api/export?source_key=${encodeURIComponent(key)}" role="button" download="${h(exportFilename(key))}">Export</a>`; }]
+  ], asRows(data.items))}`;
 }
 
 function renderIndexes(data: Row): string {
