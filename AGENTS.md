@@ -1,10 +1,10 @@
 # AGENTS.md
 
-This file applies to the entire `yuantiji/src` repository. Read before making code changes.
+Read before making code changes.
 
 ## Single Source of Truth
 
-`PLAN.md` is the sole source of truth for product and architecture. When code conflicts with `PLAN.md`, migrate toward `PLAN.md` while keeping intermediate states runnable. Do not treat earlier conversation plans as authoritative.
+`PLAN.md` is the sole source of truth for product and architecture. When code conflicts with `PLAN.md`, migrate toward `PLAN.md` while keeping intermediate states runnable.
 
 ## Prohibitions
 
@@ -21,13 +21,12 @@ Do not leave two competing implementations for the same endpoint.
 ## Hard Constraints
 
 ```text
-Repository root: C:\code\yuantiji\src
 Deployment model: single machine, single process, single Uvicorn worker, single background job worker.
 SQLite connections: always PRAGMA foreign_keys=ON; journal_mode=WAL; busy_timeout=5000;
 Schema migration: PRAGMA user_version, not Alembic.
 Frontend stack: vanilla TypeScript + Vite; admin uses PicoCSS classless styles; no component frameworks.
 Admin UI style: dense and operational (tables, filters, status, logs), not marketing-style.
-Language: use English for all code, comments, UI text, and API responses. Do not mix Chinese and English.
+Language: use English for code, comments, and API responses unless existing user-facing behavior requires otherwise.
 ```
 
 ## Workflow
