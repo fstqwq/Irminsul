@@ -358,7 +358,7 @@ def create_app() -> FastAPI:
         return {
             "top_retrieval": search_config.top_retrieval,
             "top_display": search_config.top_display,
-            "default_beta": search_config.beta,
+            "beta": search_config.beta,
             "default_rerank": search_config.default_rerank,
         }
 

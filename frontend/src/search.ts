@@ -382,7 +382,7 @@ function renderResultRow(candidate: Candidate, state: AppState): string {
   const id = escapeHtml(candidate.problem_id);
   const title = escapeHtml(candidate.title || candidate.problem_id);
   const source = escapeHtml(sourceLabel(candidate));
-  const score = candidateScore(candidate, state.sortMode, state.config.default_beta);
+  const score = candidateScore(candidate, state.sortMode, state.config.beta);
   const scoreText = formatScore(score);
   const viewText = candidate[state.resultView] || candidate.statement || candidate.clean;
   const statement = renderMathText(viewText);

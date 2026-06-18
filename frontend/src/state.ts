@@ -1,4 +1,4 @@
-export type StageName = "rewrite" | "embed" | "search" | "rerank";
+export type StageName = "rewrite" | "embed" | "rerank";
 export type StageState = "idle" | "active" | "done" | "skip" | "error";
 export type SortMode = "combined" | "embedding" | "rerank";
 export type ResultView = "clean" | "statement" | "abstract" | "abstract_zh";
@@ -13,7 +13,7 @@ export type Stage = {
 export type Config = {
   top_retrieval: number;
   top_display: number;
-  default_beta: number;
+  beta: number;
   default_rerank: boolean;
 };
 
@@ -79,12 +79,11 @@ export type AppState = {
   hasSearched: boolean;
 };
 
-export const stageOrder: StageName[] = ["rewrite", "embed", "search", "rerank"];
+export const stageOrder: StageName[] = ["rewrite", "embed", "rerank"];
 
 export const stageLabels: Record<StageName, string> = {
   rewrite: "Rewrite",
   embed: "Embed",
-  search: "Search",
   rerank: "Rerank"
 };
 
@@ -104,7 +103,7 @@ export const resultViewLabels: Record<ResultView, string> = {
 export const defaultConfig: Config = {
   top_retrieval: 200,
   top_display: 20,
-  default_beta: 0.75,
+  beta: 0.75,
   default_rerank: true
 };
 
@@ -137,7 +136,6 @@ export function initialStages(): Record<StageName, Stage> {
   return {
     rewrite: { name: "rewrite", state: "idle" },
     embed: { name: "embed", state: "idle" },
-    search: { name: "search", state: "idle" },
     rerank: { name: "rerank", state: "idle" }
   };
 }
@@ -191,12 +189,12 @@ export function sortedCandidates(state: AppState): Candidate[] {
   return [...state.candidates]
     .map((candidate) => ({
       ...candidate,
-      final_score: candidateScore(candidate, mode, state.config.default_beta)
+      final_score: candidateScore(candidate, mode, state.config.beta)
     }))
     .sort((a, b) => {
       const diff =
-        candidateScore(b, mode, state.config.default_beta) -
-        candidateScore(a, mode, state.config.default_beta);
+        candidateScore(b, mode, state.config.beta) -
+        candidateScore(a, mode, state.config.beta);
       if (Number.isFinite(diff) && diff !== 0) return diff;
       return (a.title || a.problem_id).localeCompare(b.title || b.problem_id);
     });

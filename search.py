@@ -382,7 +382,7 @@ def rerank_documents_with_usage(
     timeout: int = 240,
 ) -> RerankCallResult:
     if not documents:
-        return RerankCallResult([], {"pair_count": 0})
+        return RerankCallResult([], {})
 
     payload = _post_model_json(model_config, {"queries": [query], "documents": documents}, timeout)
     scores = payload.get("scores")
@@ -394,7 +394,7 @@ def rerank_documents_with_usage(
         input_tokens = inference_status.get("tokens_input")
     return RerankCallResult(
         [float(score) for score in scores],
-        _payload_usage(payload, {"input_tokens": input_tokens, "pair_count": len(documents)}),
+        _payload_usage(payload, {"input_tokens": input_tokens}),
     )
 
 
@@ -503,7 +503,6 @@ def _estimate_cost_microusd(usage: dict[str, Any], pricing: dict[str, Any]) -> i
     if input_tokens == 0 and output_tokens == 0:
         input_tokens = _numeric(usage.get("total_tokens", 0))
 
-    pair_count = _numeric(usage.get("pair_count", 0))
     cost = 0.0
     cost += (
         input_tokens
@@ -515,13 +514,6 @@ def _estimate_cost_microusd(usage: dict[str, Any], pricing: dict[str, Any]) -> i
         * _numeric(pricing.get("output_price_per_1m_tokens_microusd"))
         / 1_000_000
     )
-    cost += pair_count * _numeric(pricing.get("price_per_1k_pairs_microusd")) / 1_000
-    cost += (
-        pair_count
-        * _numeric(pricing.get("price_per_1m_pairs_microusd"))
-        / 1_000_000
-    )
-    cost += pair_count * _numeric(pricing.get("price_per_pair_microusd"))
     return int(round(cost))
 
 
@@ -609,6 +601,10 @@ def search_events_loaded(
     request_id = uuid.uuid4().hex
     started_at = utc_now()
     api_calls: list[dict[str, Any]] = []
+    audit_status = "failed"
+    audit_result: dict[str, Any] = {"candidates": []}
+    audit_cost: dict[str, Any] | None = None
+    audit_error: str | None = None
 
     try:
         edited_clean = (getattr(request, "edited_clean", None) or "").strip()
@@ -623,7 +619,7 @@ def search_events_loaded(
                 statement=edited_statement,
                 abstract=edited_abstract or edited_statement,
                 abstract_zh=edited_abstract_zh or edited_abstract or edited_statement,
-                raw="",
+                raw=request.query_text,
             )
             yield _stage("rewrite", "done", detail="edited")
             yield ndjson_event(
@@ -632,7 +628,7 @@ def search_events_loaded(
                 statement=rewrite.statement,
                 abstract=rewrite.abstract,
                 abstract_zh=rewrite.abstract_zh,
-                raw="",
+                raw=rewrite.raw,
                 edited=True,
             )
         elif request.use_rewrite:
@@ -704,21 +700,11 @@ def search_events_loaded(
         timings["embed"] = embed_elapsed
         yield _stage("embed", "done", elapsed=embed_elapsed, detail="4 input")
 
-        yield _stage("search", "active", detail=f"top{search_config.top_per_doc_view}")
-        search_start = perf_counter()
         candidates = retrieve_loaded_index(
             loaded_index,
             query_vectors,
             search_config.top_per_doc_view,
         )[: search_config.top_retrieval]
-        search_elapsed = perf_counter() - search_start
-        timings["search"] = search_elapsed
-        yield _stage(
-            "search",
-            "done",
-            elapsed=search_elapsed,
-            detail=f"{len(candidates)} candidates",
-        )
 
         if request.use_rerank:
             rerank_candidates = rerank_candidate_window(candidates, search_config.rerank_top_k)
@@ -762,42 +748,35 @@ def search_events_loaded(
         )
         cost = _total_cost(api_calls)
         result_summary = _audit_result_summary(fused)
-        write_search_audit(
-            settings=settings,
-            request_id=request_id,
-            started_at=started_at,
-            status="succeeded",
-            client_ip=client_ip,
-            user_agent=user_agent,
-            query=request.query_text,
-            timings=timings,
-            api_calls=api_calls,
-            result=result_summary,
-            cost=cost,
-            error=None,
-        )
+        audit_status = "succeeded"
+        audit_result = result_summary
+        audit_cost = cost
         yield ndjson_event(
             "candidates",
             candidates=[asdict(candidate) for candidate in fused],
             timings=timings,
             cost=cost,
         )
-        yield ndjson_event("done")
     except Exception as exc:
+        audit_error = str(exc)
+    finally:
         write_search_audit(
             settings=settings,
             request_id=request_id,
             started_at=started_at,
-            status="failed",
+            status=audit_status,
             client_ip=client_ip,
             user_agent=user_agent,
             query=getattr(request, "query_text", ""),
             timings=timings,
             api_calls=api_calls,
-            result={"candidates": []},
-            cost=_total_cost(api_calls),
-            error=str(exc),
+            result=audit_result,
+            cost=audit_cost or _total_cost(api_calls),
+            error=audit_error,
         )
+    if audit_error is None:
+        yield ndjson_event("done")
+    else:
         yield ndjson_event("error", message=str(exc))
 
 

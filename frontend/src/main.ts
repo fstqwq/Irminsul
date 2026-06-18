@@ -127,7 +127,7 @@ async function runSearch(overrides?: RewritePayload): Promise<void> {
         query_text: queryText,
         use_rewrite: state.useRewrite,
         use_rerank: state.useRerank,
-        beta: state.config.default_beta,
+        beta: state.config.beta,
         edited_clean: overrides?.clean,
         edited_statement: overrides?.statement,
         edited_abstract: overrides?.abstract,
@@ -204,7 +204,7 @@ render();
 fetchConfig()
   .then((config) => {
     state.config = config;
-    state.useRerank = config.default_rerank;
+    state.useRerank = state.config.default_rerank;
     render();
   })
   .catch(() => {

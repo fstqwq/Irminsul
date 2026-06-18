@@ -130,7 +130,7 @@ def test_search_stream_with_mocks(monkeypatch, tmp_path: Path) -> None:
         )
 
     def fake_rerank(*args, **kwargs):
-        return search_module.RerankCallResult([0.8], {"pair_count": 1})
+        return search_module.RerankCallResult([0.8], {})
 
     monkeypatch.setattr(app_module, "settings", lambda: test_settings)
     monkeypatch.setattr(app_module, "index_state", lambda: state)
@@ -245,7 +245,7 @@ def test_search_rerank_positive_top_k_truncates_returned_candidates(monkeypatch,
     def fake_rerank(*args, **kwargs):
         documents = args[2]
         assert len(documents) == 2
-        return search_module.RerankCallResult([0.4, 0.9], {"pair_count": len(documents)})
+        return search_module.RerankCallResult([0.4, 0.9], {})
 
     monkeypatch.setattr(search_module, "embed_texts_with_usage", fake_embed)
     monkeypatch.setattr(search_module, "rerank_documents_with_usage", fake_rerank)
@@ -341,6 +341,7 @@ def test_search_edited_rewrite_uses_all_four_views(monkeypatch, tmp_path: Path) 
     assert rewrite_event["statement"] == "edited statement"
     assert rewrite_event["abstract"] == "edited abstract"
     assert rewrite_event["abstract_zh"] == "edited zh"
+    assert rewrite_event["raw"] == "hello"
     assert captured["texts"] == [
         "edited clean",
         "edited statement",

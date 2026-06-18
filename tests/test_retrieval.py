@@ -168,7 +168,6 @@ def test_reranker_usage_reads_deepinfra_top_level_tokens(monkeypatch) -> None:
 
     assert result.scores == [0.8, 0.2]
     assert result.usage["input_tokens"] == 1200
-    assert result.usage["pair_count"] == 2
 
 
 def test_rewrite_request_includes_provider_routing(monkeypatch) -> None:

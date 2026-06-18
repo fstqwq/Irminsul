@@ -17,7 +17,6 @@ from typing import Any, Iterator, Literal, Sequence
 
 
 SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SRC_DIR.parent
 DEFAULT_CONFIG_PATH = SRC_DIR / "config.toml"
 SCHEMA_VERSION = 2
 
@@ -159,10 +158,7 @@ def utc_now() -> str:
 
 
 def load_dotenv(
-    paths: tuple[Path, ...] = (
-        SRC_DIR / ".env",
-        PROJECT_ROOT / ".env",
-    ),
+    paths: tuple[Path, ...] = (SRC_DIR / ".env",),
 ) -> None:
     for path in paths:
         if not path.exists():
@@ -209,7 +205,7 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
     admin = raw.get("admin", {})
     limits = raw.get("limits", {})
     jobs = raw.get("jobs", {})
-    search = raw.get("search", raw.get("retrieval", {}))
+    search = raw.get("search", {})
     index_cache = raw.get("index_cache", {})
     audit = raw.get("audit", {})
     models = raw.get("models", {})
@@ -247,7 +243,7 @@ def get_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> Settings:
             top_retrieval=int(search.get("top_retrieval", 200)),
             top_display=int(search.get("top_display", 20)),
             rerank_top_k=int(search.get("rerank_top_k", 0)),
-            beta=float(search.get("beta", search.get("default_beta", 0.75))),
+            beta=float(search.get("beta", 0.75)),
             default_rerank=bool(search.get("default_rerank", True)),
             rerank_range_floor=float(search.get("rerank_range_floor", 0.1)),
             embedding_range_floor=float(search.get("embedding_range_floor", 0.05)),
@@ -567,13 +563,6 @@ def db_exec(settings: Settings, sql: str, params: Sequence[Any] = ()) -> int:
     with db_write_connection(settings) as conn:
         with conn:
             return conn.execute(sql, params).rowcount
-
-
-def db_exec_many(settings: Settings, statements: list[tuple[str, Sequence[Any]]]) -> None:
-    with db_write_connection(settings) as conn:
-        with conn:
-            for sql, params in statements:
-                conn.execute(sql, params)
 
 
 def get_job(settings: Settings, job_key: str) -> dict[str, Any] | None:
