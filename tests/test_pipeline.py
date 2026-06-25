@@ -31,6 +31,7 @@ from pipeline import (
     rebuild_index_cache,
     rewrite_method_key,
     run_next_job,
+    source_key_from_problem_id,
 )
 from search import IndexState, RewriteResult, load_index_cache
 
@@ -44,6 +45,12 @@ def _temp_settings(tmp_path: Path):
         index_cache_dir=tmp_path / "index_cache",
     )
     return replace(base_settings, storage=storage)
+
+
+def test_source_key_uses_only_slash_separator() -> None:
+    assert source_key_from_problem_id("CODEFORCES_GYM/100199A") == "CODEFORCES_GYM"
+    assert source_key_from_problem_id(" CODEFORCES/1A ") == "CODEFORCES"
+    assert source_key_from_problem_id("CODEFORCES_GYM_100199A") == "unknown"
 
 
 def test_method_keys_use_model_identity_not_provider(tmp_path: Path) -> None:

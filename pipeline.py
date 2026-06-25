@@ -256,12 +256,9 @@ class EmbeddingWorkItem:
 
 
 def source_key_from_problem_id(problem_id: str) -> str:
-    cleaned = problem_id.strip()
-    for separator in ("/", ":", "_", "-"):
-        if separator in cleaned:
-            prefix = cleaned.split(separator, 1)[0].strip()
-            if prefix:
-                return prefix
+    prefix, separator, _ = problem_id.strip().partition("/")
+    if separator and prefix.strip():
+        return prefix.strip()
     return "unknown"
 
 
