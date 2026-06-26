@@ -1,6 +1,63 @@
 # Irminsul
 
-Competitive programming problem search engine with four-view semantic retrieval. Supports incremental data maintenance -- problems, rewrites, and embeddings are managed independently and composed into immutable indexes on demand.
+Irminsul is a competitive programming problem search engine and an alternative implementation of [yuantiji.ac](https://github.com/fjzzq2002/is-my-problem-new).
+
+## What is new?
+
+LLM-based retrieval is now mature and accessible, but the hard part in a real deployment is the quality of the crawled data behind it. PDF statements often need OCR or encoding repair, and extraction errors can change the meaning of a problem.
+
+Irminsul treats *data repair* as a first-class workflow: problems, rewrites, and embeddings are managed independently, then composed into immutable search indexes on demand. When crawled statements are corrected or refreshed, only the affected artifacts need to be regenerated.
+
+> What is [Irminsul](https://genshin-impact.fandom.com/wiki/Irminsul)?
+
+## Data Flow
+
+```mermaid
+flowchart LR
+    subgraph SQLite
+        P["problems\n+ sources"]
+        R["rewrite\nartifacts"]
+        E["embedding\nartifacts"]
+        I["index_rows"]
+    end
+
+    JSONL -->|import| P
+    P -->|LLM| R
+    R -->|embed| E
+    P & R & E -->|build| I
+
+    subgraph Disk Cache
+        NPY[".npy x 4 views\nproblems.jsonl\nviews.jsonl"]
+    end
+
+    I -->|export| NPY
+    NPY -->|activate + search| Client(["Client"])
+```
+
+### Admin workflow
+
+Upload JSONL, review the dry run, confirm the import, build an index, and activate it. Each step is incremental: re-importing updates only changed problems, and rebuilding reuses existing rewrites and embeddings whenever possible.
+
+Use the admin **Jobs** page to inspect failed or blocked jobs.
+
+If a problem repeatedly fails during rewrite or embedding, edit, translate, or disable it from the admin UI, then start a new job. Existing jobs use fixed snapshots, so they will not pick up edits made after the job was created.
+
+> **Note**: the API provider matters. In our experiments, the official DeepSeek V4 Flash API produced significantly more reliable rewrite results (0.5% error rate) than the same model routed through OpenRouter (>2% error rate).
+
+### JSONL format
+
+```json
+{"id": "CodeForces/1A", "title": "Theatre Square", "text": "...", "url": "https://..."}
+```
+
+| Field   | Required | Description                      |
+|---------|----------|----------------------------------|
+| `id`    | yes      | Unique problem identifier        |
+| `title` | no       | Display title (defaults to `id`) |
+| `text`  | yes      | Problem statement                |
+| `url`   | no       | Link to original problem         |
+
+See `sample_data/` for reference JSONL files.
 
 ## Quickstart
 
@@ -54,45 +111,6 @@ uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 
 > **Do not** run multiple Uvicorn workers against the same SQLite database.
 
-## Data Flow
-
-```mermaid
-flowchart LR
-    subgraph SQLite
-        P["problems\n+ sources"]
-        R["rewrite\nartifacts"]
-        E["embedding\nartifacts"]
-        I["index_rows"]
-    end
-
-    JSONL -->|import| P
-    P -->|LLM| R
-    R -->|embed| E
-    P & R & E -->|build| I
-
-    subgraph Disk Cache
-        NPY[".npy x 4 views\nproblems.jsonl\nviews.jsonl"]
-    end
-
-    I -->|export| NPY
-    NPY -->|activate + search| Client(["Client"])
-```
-
-Admin workflow: upload JSONL -> review dry-run -> confirm import -> build index -> activate. Each step is incremental -- re-importing updates only changed problems, and rebuilding reuses existing rewrites and embeddings.
-
-### JSONL format
-
-```json
-{"id": "CodeForces/1A", "title": "Theatre Square", "text": "...", "url": "https://..."}
-```
-
-| Field   | Required | Description                      |
-|---------|----------|----------------------------------|
-| `id`    | yes      | Unique problem identifier        |
-| `title` | no       | Display title (defaults to `id`) |
-| `text`  | yes      | Problem statement                |
-| `url`   | no       | Link to original problem         |
-
 ## Configuration
 
 All configuration is in `config.toml`. See the file for the full reference. Key sections:
@@ -131,7 +149,6 @@ On startup the service automatically:
 - Loads the active index from the database
 - Starts the background job worker
 
-Use the admin **Jobs** page to inspect failed or blocked jobs.
 
 ## Development
 
