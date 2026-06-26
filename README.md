@@ -174,4 +174,6 @@ core.py      - Settings, DB helpers, schema, CRUD
 pipeline.py  - Import, rewrite, embedding, build index, cache export
 search.py    - API clients, search pipeline, audit
 frontend/    - Vanilla TypeScript + Vite, PicoCSS admin UI
+AGENTS.md    - Working conventions for future agents
+PLAN.md      - Current implementation plan and design notes
 ```
