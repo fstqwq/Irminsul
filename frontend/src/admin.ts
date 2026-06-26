@@ -39,6 +39,10 @@ const settingsKeyLabels: Record<string, string> = {
   api_key_env: "API key environment variable", provider: "Provider routing"
 };
 
+function emptyDetails(): Record<DetailKey, Row | null> {
+  return { import: null, problem: null, index: null, job: null, audit: null };
+}
+
 const state: AdminState = {
   page: "dashboard",
   authenticated: false,
@@ -47,7 +51,7 @@ const state: AdminState = {
   notice: "",
   data: {},
   draftImport: null,
-  details: { import: null, problem: null, index: null, job: null, audit: null },
+  details: emptyDetails(),
   filters: {
     problems: { q: "", source_key: "", enabled: "", deleted: "false", limit: 25, offset: 0 },
     jobs: { type: "", status: "", limit: 50 },
@@ -67,7 +71,9 @@ class ApiError extends Error {
 export function startAdmin(root: HTMLElement): void {
   rootEl = root;
   window.addEventListener("hashchange", () => {
-    state.page = pageFromHash();
+    const nextPage = pageFromHash();
+    if (nextPage !== state.page) state.details = emptyDetails();
+    state.page = nextPage;
     state.error = "";
     state.notice = "";
     void loadPage();
